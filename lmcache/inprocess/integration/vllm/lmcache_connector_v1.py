@@ -21,6 +21,7 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.config import KVTransferConfig
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -30,6 +31,20 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+    @classmethod
+    def supports_lookahead_block_hashes(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Advertise the versioned in-process lookahead protocol.
+
+        Args:
+            kv_transfer_config: vLLM's connector configuration.
+
+        Returns:
+            True; unsupported cache groups and modes fail adapter initialization.
+        """
+        return True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -44,7 +59,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             )
         else:
             super().__init__(vllm_config=vllm_config, role=role)
-        self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+        self._lmcache_engine = LMCacheConnectorV1Impl(
+            vllm_config, role, self, kv_cache_config=kv_cache_config
+        )
 
     # ==============================
     # Worker-side methods
