@@ -110,7 +110,11 @@ class StoreMixin:
                 key.token_bytes[key.start * TOKEN_STRIDE : key.end * TOKEN_STRIDE]
             )
             # Chunk 0 is owned by the prefix lookup leg; skip its fingerprint.
-            start_chunk_idx = 0 if key.start != 0 else 1
+            # A recurrent registration (align-mode Mamba/linear layers) is the
+            # exception: its prefix leg can only end on a stored state page,
+            # which a prefill writes at its last full block, never at chunk 0,
+            # so the blend leg is the only reader of a prompt's first chunks.
+            start_chunk_idx = 0 if (key.start != 0 or read.recurrent_gids) else 1
 
             # Register only committed chunks: a fingerprint for a skipped
             # chunk would advertise content that was never persisted.
