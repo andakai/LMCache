@@ -131,14 +131,11 @@ def test_packed_kv_transfer(use_gpu: bool, layout: str, version: int) -> None:
     allocator = TensorMemoryAllocator(
         torch.empty(1024 * 1024, dtype=torch.uint8, pin_memory=True)
     )
-    for num_tokens in (chunk_size, 7):
+    for num_tokens in (chunk_size, 7, chunk_size):
         pool.copy_(original)
         slots = torch.randperm(nb * bs, device=device)[:num_tokens]
-        obj_shape = (
-            torch.Size([2, nl, num_tokens, nh * hs])
-            if version == 2
-            else torch.Size([1, nl, num_tokens, nh * 2 * hs])
-        )
+        # CacheEngine allocates before the first transfer discovers layer groups.
+        obj_shape = metadata.get_shapes(num_tokens)[0]
         memory_obj = allocator.allocate(obj_shape, pool.dtype)
         assert memory_obj is not None
         torch.cuda.synchronize()
