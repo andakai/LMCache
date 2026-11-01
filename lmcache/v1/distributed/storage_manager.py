@@ -339,6 +339,23 @@ class StorageManager:
 
         return result
 
+    def abort_write(self, l1_owners: dict[ObjectKey, int]) -> None:
+        """Discard this manager's failed write reservations without admitting them.
+
+        Call only after all writes to the reserved buffers have completed.
+        Other writers' staging objects and resident copies remain untouched.
+
+        Args:
+            l1_owners: Owning L1 manager per reserved key, from ``l1_owners_of``.
+
+        Raises:
+            ValueError: An owner is not a registered L1 manager.
+        """
+        for owner, keys in self._group_by_owner(list(l1_owners), l1_owners).items():
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
+
     @enable_tracing(redact=("l1_owners",))
     def finish_write(
         self,

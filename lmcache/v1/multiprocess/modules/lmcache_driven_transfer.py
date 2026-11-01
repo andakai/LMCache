@@ -205,6 +205,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             payload_type=dict[ObjectKey, int],
         )
         self._device_host_func_dispatcher.register(
+            "abort_write",
+            self._ctx.storage_manager.abort_write,
+            payload_type=dict[ObjectKey, int],
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
@@ -824,6 +829,14 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                    if all_dict:
+                        # Earlier groups may already have queued D2H copies.
+                        # Release their buffers only after those copies land.
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write",
+                            l1_owners_of(all_dict),
+                        )
                 # Report only chunks that actually stored.
                 stored_chunks = (
                     sum(
