@@ -420,14 +420,14 @@ class ReqMeta:
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
             # TODO: Optimize this
-            token_ids = torch.tensor(token_ids)
+            mm_token_ids = torch.tensor(token_ids)
             assert tracker.mm_positions is not None, (
                 "tracker got mm_hashes but no mm_positions"
             )
             apply_mm_hashes_to_token_ids(
-                token_ids, tracker.mm_hashes, tracker.mm_positions
+                mm_token_ids, tracker.mm_hashes, tracker.mm_positions
             )
-            token_ids = token_ids.tolist()
+            token_ids = mm_token_ids.tolist()
 
         lookahead_token_ids = token_ids[num_kv_tokens:]
         token_ids = token_ids[:num_kv_tokens]
