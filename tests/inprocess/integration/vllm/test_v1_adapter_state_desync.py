@@ -33,8 +33,86 @@ pytest.importorskip("vllm")
 from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
+    LoadSpec,
+    ReqMeta,
+    RequestTracker,
     SaveSpec,
 )
+
+
+@pytest.mark.parametrize("lookahead", [1, 3, 17])
+def test_hash_context_does_not_allocate_or_save_extra_kv(lookahead: int) -> None:
+    tracker = RequestTracker(
+        req_id="lookahead",
+        prompt_len=96,
+        token_ids=list(range(32)),
+        allocated_block_ids=[2, 3],
+    )
+    meta = ReqMeta.from_request_tracker(
+        tracker,
+        16,
+        16,
+        num_hash_lookahead_tokens=lookahead,
+        hash_context=list(range(32 + lookahead)),
+    )
+    assert meta is not None
+    assert meta.token_ids == list(range(32))
+    assert meta.lookahead_token_ids == list(range(32, 32 + lookahead))
+    assert meta.slot_mapping.tolist() == list(range(32, 64))
+    assert tracker.num_saved_tokens == 32
+
+
+def test_final_prompt_chunk_waits_for_hash_context_without_decode_saves() -> None:
+    tracker = RequestTracker(
+        req_id="lookahead",
+        prompt_len=32,
+        token_ids=list(range(32)),
+        allocated_block_ids=[2, 3],
+    )
+    first = ReqMeta.from_request_tracker(
+        tracker,
+        16,
+        16,
+        num_hash_lookahead_tokens=1,
+        hash_context=list(range(32)),
+    )
+    assert first is not None
+    assert len(first.token_ids) == tracker.num_saved_tokens == 16
+    tracker.is_decode_phase = True
+    second = ReqMeta.from_request_tracker(
+        tracker,
+        16,
+        16,
+        num_hash_lookahead_tokens=1,
+        hash_context=list(range(33)),
+    )
+    assert second is not None
+    assert len(second.token_ids) == tracker.num_saved_tokens == 32
+    assert second.save_spec == SaveSpec(skip_leading_tokens=16, can_save=True)
+    assert second.lookahead_token_ids == [32]
+
+
+def test_decode_load_keeps_hash_context_when_decode_save_is_disabled() -> None:
+    tracker = RequestTracker(
+        req_id="load",
+        prompt_len=16,
+        token_ids=list(range(48)),
+        allocated_block_ids=[2, 3, 4],
+        num_saved_tokens=48,
+    )
+    meta = ReqMeta.from_request_tracker(
+        tracker,
+        16,
+        16,
+        load_spec=LoadSpec(0, 48, True),
+        num_hash_lookahead_tokens=1,
+        hash_context=list(range(49)),
+    )
+    assert meta is not None
+    assert meta.save_spec is not None and not meta.save_spec.can_save
+    assert len(meta.token_ids) == len(meta.slot_mapping) == 48
+    assert meta.lookahead_token_ids == [48]
+    assert tracker.num_saved_tokens == 48
 
 
 class _FakeParent:

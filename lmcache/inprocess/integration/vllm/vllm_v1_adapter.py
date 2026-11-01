@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import hashlib
 import math
 import os
 import sys
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
     # First Party
@@ -100,6 +102,27 @@ tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     return extract_request_configs_from_sampling_params(sampling_params)
+
+
+def _lookahead_request_configs(request: "Request") -> dict[str, Any]:
+    """Preserve user tags and isolate LoRA and cache-salt identities in keys.
+
+    Args:
+        request: The accepted vLLM request used for lookup and metadata.
+
+    Returns:
+        Request configuration with the lookahead identity stored as a key tag.
+    """
+    configs = dict(extract_request_configs(request.sampling_params) or {})
+    lora = request.lora_request
+    identity = (
+        request.cache_salt,
+        (lora.lora_name, lora.lora_int_id) if lora else None,
+    )
+    configs["lmcache.tag.lookahead_request"] = hashlib.sha256(
+        repr(identity).encode()
+    ).hexdigest()
+    return configs
 
 
 @dataclass
@@ -289,6 +312,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Hash context only; these tokens have no corresponding KV slots.
+    lookahead_token_ids: list[int] = field(default_factory=list)
 
     @staticmethod
     def from_request_tracker(
@@ -298,6 +323,8 @@ class ReqMeta:
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
+        num_hash_lookahead_tokens: int = 0,
+        hash_context: Optional[list[int]] = None,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -308,6 +335,9 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            num_hash_lookahead_tokens (int): following tokens covered by each key.
+            hash_context (Optional[list[int]]): accepted tokens, including the
+                hash-only suffix beyond the scheduled KV range.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -315,6 +345,16 @@ class ReqMeta:
         """
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
+        if num_hash_lookahead_tokens:
+            if hash_context is None:
+                raise ValueError("Lookahead hashing requires accepted token context")
+            input_token_ids = hash_context
+            input_token_len = min(
+                input_token_len,
+                max(0, len(hash_context) - num_hash_lookahead_tokens),
+            )
+            if not save_decode_cache:
+                input_token_len = min(input_token_len, tracker.prompt_len)
 
         is_last_prefill = False
         if input_token_len >= tracker.prompt_len:
@@ -337,7 +377,11 @@ class ReqMeta:
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
             or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
-            or (tracker.is_decode_phase and not save_decode_cache)
+            or (
+                tracker.is_decode_phase
+                and not save_decode_cache
+                and not num_hash_lookahead_tokens
+            )
             or request_skip
         )
 
@@ -350,12 +394,17 @@ class ReqMeta:
         # NOTE(vladnosiv): for the input_token_len chunk prefill,
         # we are required to discard partial chunks,
         # as new tokens will be added in the next iteration.
-        if not is_last_prefill or discard_partial_chunks:
+        if num_hash_lookahead_tokens or not is_last_prefill or discard_partial_chunks:
             num_tokens_to_save = (
                 input_token_len // lmcache_chunk_size * lmcache_chunk_size
             )
         else:
             num_tokens_to_save = input_token_len
+
+        if num_hash_lookahead_tokens and num_tokens_to_save <= skip_leading_tokens:
+            skip_save = True
+        if skip_save and load_spec is None:
+            return None
 
         # If we need to save, update the number of saved tokens
         if not skip_save:
@@ -363,7 +412,10 @@ class ReqMeta:
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # Calculate the token ids and slot mappings for load and save
-        token_ids = input_token_ids[:num_tokens_to_save]
+        num_kv_tokens = num_tokens_to_save
+        if num_hash_lookahead_tokens and load_spec is not None:
+            num_kv_tokens = max(num_kv_tokens, load_spec.lmcache_cached_tokens)
+        token_ids = input_token_ids[: num_kv_tokens + num_hash_lookahead_tokens]
 
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
@@ -376,6 +428,9 @@ class ReqMeta:
                 token_ids, tracker.mm_hashes, tracker.mm_positions
             )
             token_ids = token_ids.tolist()
+
+        lookahead_token_ids = token_ids[num_kv_tokens:]
+        token_ids = token_ids[:num_kv_tokens]
 
         num_blocks = len(tracker.allocated_block_ids)
 
@@ -428,6 +483,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            lookahead_token_ids=lookahead_token_ids,
         )
 
 
@@ -446,11 +502,15 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
 
 
 class LMCacheConnectorV1Impl:
+    LOOKAHEAD_HASHES_VERSION = 1
+    num_hash_lookahead_tokens: int = 0
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         # Banner from the scheduler role only, so tensor-parallel
         # deployments print it once rather than once per worker.
@@ -470,6 +530,41 @@ class LMCacheConnectorV1Impl:
             "LMCache v1 configuration is should be passed for vLLM v1."
         )
         self._apply_extra_config(config, vllm_config)
+        self.num_hash_lookahead_tokens = getattr(
+            vllm_config, "num_hash_lookahead_tokens", 0
+        )
+        if self.num_hash_lookahead_tokens:
+            # Third Party
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, iter_layer_specs
+
+            if config.use_layerwise or config.enable_blending or config.enable_pd:
+                raise ValueError(
+                    "LMCache lookahead requires non-layerwise, non-Blend storage "
+                    "without LMCache P/D transfer"
+                )
+            if kv_cache_config is None or len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError("LMCache V1 lookahead requires one resolved KV group")
+            if not all(
+                isinstance(spec, FullAttentionSpec)
+                and spec.sliding_window is None
+                and spec.attention_chunk_size is None
+                and not spec.non_causal
+                for spec in iter_layer_specs(
+                    kv_cache_config.kv_cache_groups[0].kv_cache_spec
+                )
+            ):
+                raise ValueError("LMCache V1 lookahead requires full-attention KV")
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.pipeline_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+            ):
+                raise ValueError("LMCache V1 lookahead does not support PP or CP")
+        config.extra_config = dict(config.extra_config or {})
+        config.extra_config["num_hash_lookahead_tokens"] = (
+            self.num_hash_lookahead_tokens
+        )
         self.config = config
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
@@ -811,12 +906,14 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
-            tokens = request.token_ids
+            tokens = request.token_ids + (
+                request.lookahead_token_ids if self.num_hash_lookahead_tokens else []
+            )
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
-            assert len(tokens) == len(slot_mapping)
+            assert len(request.token_ids) == len(slot_mapping)
 
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            token_mask = torch.ones(len(slot_mapping), dtype=torch.bool)
             masked_token_count = (
                 request.load_spec.vllm_cached_tokens
                 // self._lmcache_chunk_size
@@ -855,7 +952,7 @@ class LMCacheConnectorV1Impl:
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
+                    tokens[: lmcache_cached_tokens + self.num_hash_lookahead_tokens],
                     token_mask[:lmcache_cached_tokens],
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
@@ -863,6 +960,7 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
+                ret_token_mask = ret_token_mask[:lmcache_cached_tokens]
                 if not self.async_loading:
                     # Blocking retrieve releases get references, not lookup pins.
                     # Release this request's pins before the next load may need
@@ -1227,7 +1325,12 @@ class LMCacheConnectorV1Impl:
                     )
 
             self.lmcache_engine.store(
-                token_ids,
+                token_ids
+                + (
+                    request.lookahead_token_ids
+                    if self.num_hash_lookahead_tokens
+                    else []
+                ),
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
@@ -1379,6 +1482,8 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+        if self.num_hash_lookahead_tokens and request.prompt_embeds is not None:
+            return 0
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1426,7 +1531,11 @@ class LMCacheConnectorV1Impl:
                 apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
                 token_ids = token_ids.tolist()
 
-            request_configs = extract_request_configs(request.sampling_params)
+            request_configs = (
+                _lookahead_request_configs(request)
+                if self.num_hash_lookahead_tokens
+                else extract_request_configs(request.sampling_params)
+            )
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -1673,14 +1782,7 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=load_spec,
-                discard_partial_chunks=self._discard_partial_chunks,
-                save_decode_cache=self.config.save_decode_cache,
-            )
+            req_meta = self._build_req_meta(request_tracker, load_spec)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -1719,14 +1821,7 @@ class LMCacheConnectorV1Impl:
                     all_token_ids=all_token_ids,
                 )
 
-                req_meta = ReqMeta.from_request_tracker(
-                    request_tracker,
-                    self._block_size,
-                    self._lmcache_chunk_size,
-                    load_spec=load_spec,
-                    discard_partial_chunks=self._discard_partial_chunks,
-                    save_decode_cache=self.config.save_decode_cache,
-                )
+                req_meta = self._build_req_meta(request_tracker, load_spec)
                 if req_meta is not None:
                     meta.add_request(req_meta)
             return meta
@@ -1842,14 +1937,7 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=load_spec,
-                discard_partial_chunks=self._discard_partial_chunks,
-                save_decode_cache=self.config.save_decode_cache,
-            )
+            req_meta = self._build_req_meta(request_tracker, load_spec)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -1945,3 +2033,24 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []
+
+    def _build_req_meta(
+        self, tracker: RequestTracker, load_spec: Optional[LoadSpec]
+    ) -> Optional[ReqMeta]:
+        hash_context = None
+        if self.num_hash_lookahead_tokens:
+            request = self._unfinished_requests[tracker.req_id]
+            hash_context = list(request.all_token_ids)
+            tracker.request_configs = _lookahead_request_configs(request)
+            if request.prompt_embeds is not None:
+                tracker.skip_save = True
+        return ReqMeta.from_request_tracker(
+            tracker,
+            self._block_size,
+            self._lmcache_chunk_size,
+            load_spec=load_spec,
+            discard_partial_chunks=self._discard_partial_chunks,
+            save_decode_cache=self.config.save_decode_cache,
+            num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            hash_context=hash_context,
+        )

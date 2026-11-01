@@ -9,6 +9,7 @@ keeping the LMCacheManager agnostic to the serving engine.
 # Standard
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Union
+import hashlib
 
 if TYPE_CHECKING:
     # Third Party
@@ -146,8 +147,27 @@ class VllmServiceFactory(BaseServiceFactory):
             local_worker_id, local_world_size = calculate_local_rank_and_world_size(
                 self.vllm_config
             )
+        model_name = model_config.model
+        lookahead = getattr(self.vllm_config, "num_hash_lookahead_tokens", 0)
+        if lookahead:
+            spec = self.vllm_config.speculative_config
+            assert spec is not None
+            namespace = hashlib.sha256(
+                repr(
+                    (
+                        "lmcache-inprocess-lookahead-v1",
+                        model_config.compute_hash(),
+                        spec.compute_hash(),
+                        cache_config.compute_hash(),
+                        parallel_config.tensor_parallel_size,
+                        kv_shape,
+                        lookahead,
+                    )
+                ).encode()
+            ).hexdigest()
+            model_name += f"-lookahead-v1-{namespace}"
         self.metadata = LMCacheMetadata(
-            model_name=model_config.model,
+            model_name=model_name,
             world_size=parallel_config.world_size,
             local_world_size=local_world_size,
             worker_id=parallel_config.rank,

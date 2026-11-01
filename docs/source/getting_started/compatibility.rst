@@ -52,6 +52,29 @@ one compatibility matrix:
      - Follow the relevant model or feature recipe and treat an unlisted
        combination as unverified until it has been smoke-tested.
 
+In-process lookahead hashing
+----------------------------
+
+The vLLM in-process adapter advertises ``LOOKAHEAD_HASHES_VERSION = 1``.
+A compatible vLLM wrapper supplies the resolved lookahead count and KV cache
+configuration. Do not set ``extra_config.num_hash_lookahead_tokens`` manually;
+the adapter derives it from vLLM for both lookup and worker services.
+
+For a chunk of 16 KV tokens and lookahead 1, the key covers tokens 1--17,
+while the transfer copies only KV 1--16. The next key covers tokens 17--33
+and the preceding key. Incomplete hash windows are not saved, and do not
+advance the saved-token boundary. Zero lookahead preserves legacy keys.
+Lookahead entries use a distinct model/draft/cache-layout namespace and retain
+LoRA and cache-salt identities; legacy writers cannot supply these entries.
+
+The initial in-process path requires one full-attention KV group and excludes
+pipeline/context parallelism, layerwise transfer, CacheBlend, and LMCache P/D.
+These combinations fail initialization when lookahead is enabled. Prompt
+embeddings bypass external reuse. This support is independent of the MP
+connector and does not imply hybrid KV-group support in the in-process path.
+Only scheduled computation produces saves: a final sampling step that makes
+a new hash available without another forward may leave the last chunk unsaved.
+
 Installation and ABI compatibility
 -----------------------------------
 

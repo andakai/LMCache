@@ -28,6 +28,58 @@ def hf_credentials_available() -> bool:
     )
 
 
+@pytest.mark.parametrize("lookahead", [1, 3, 17])
+@pytest.mark.parametrize("save_unfull_chunk", [False, True])
+def test_lookahead_keys_cover_suffix_without_extending_kv(
+    lookahead: int, save_unfull_chunk: bool
+) -> None:
+    """Lookup and store share keys, while suffix changes invalidate reuse."""
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=16, backend="cpu", save_unfull_chunk=save_unfull_chunk
+    )
+    cfg.extra_config = {"num_hash_lookahead_tokens": lookahead}
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = list(range(32 + lookahead))
+    original = list(db.process_tokens(tokens=tokens))
+    assert [(start, end) for start, end, _ in original] == [(0, 16), (16, 32)]
+    assert list(db.process_tokens(tokens=tokens[:-1])) == original[:1]
+    assert list(db.process_tokens(tokens=tokens[: 16 + lookahead - 1])) == []
+
+    changed = tokens.copy()
+    changed[16] += 1000
+    assert all(
+        new_key != key
+        for (_, _, new_key), (_, _, key) in zip(
+            db.process_tokens(tokens=changed), original, strict=True
+        )
+    )
+    mask = torch.ones(32, dtype=torch.bool)
+    mask[:16] = False
+    assert list(db.process_tokens(tokens=tokens, mask=mask)) == original[1:]
+    hashes = list(db.process_tokens(tokens=tokens, make_key=False))
+    assert (
+        list(
+            db.process_tokens(
+                hashes=[key for _, _, key in hashes],
+                offsets=[end - start for start, end, _ in hashes],
+            )
+        )
+        == original
+    )
+
+    cfg.extra_config = {}
+    legacy = ChunkedTokenDatabase(cfg, dumb_metadata())
+    assert original[0][2] != next(legacy.process_tokens(tokens=tokens))[2]
+
+
+@pytest.mark.parametrize("lookahead", [-1, True, 1.5])
+def test_invalid_hash_lookahead_is_rejected(lookahead: object) -> None:
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    cfg.extra_config = {"num_hash_lookahead_tokens": lookahead}
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        ChunkedTokenDatabase(cfg, dumb_metadata())
+
+
 @pytest.mark.parametrize("chunk_length", [16, 64, 256])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 def test_chunked_token_database(chunk_length, save_unfull_chunk):

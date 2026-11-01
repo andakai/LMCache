@@ -38,6 +38,7 @@ class _CPUConnector(LMCacheConnectorV1Impl):
         requests: list[ReqMeta],
         engine: LMCacheEngine | MagicMock,
         loading: Literal["sync", "async", "layerwise"],
+        lookahead: int = 0,
     ) -> None:
         """Inject recording dependencies while inheriting the real public load API.
 
@@ -45,6 +46,7 @@ class _CPUConnector(LMCacheConnectorV1Impl):
             requests: Scheduled requests in their load order.
             engine: Real CPU engine or recording mock returning CPU token masks.
             loading: Sync/non-layerwise, async/non-layerwise, or sync/layerwise mode.
+            lookahead: Number of hash-only suffix tokens carried by each request.
         """
         metadata = LMCacheConnectorMetadata(requests=requests)
         self._parent = MagicMock(**{"_get_connector_metadata.return_value": metadata})
@@ -56,6 +58,37 @@ class _CPUConnector(LMCacheConnectorV1Impl):
         self.async_loading = loading == "async"
         self.use_layerwise = loading == "layerwise"
         self.enable_blending = False
+        self.num_hash_lookahead_tokens = lookahead
+        self._block_size = 4
+        self._invalid_block_ids: set[int] = set()
+
+
+@pytest.mark.parametrize("cache_case", [1, 3, 17], indirect=True)
+def test_lookahead_load_uses_kv_offsets_and_reports_failed_blocks(
+    cache_case: _CacheCase,  # noqa: F811 -- shared fixture
+) -> None:
+    """Actual CPU lookup/retrieve agrees on suffix keys and KV-sized failures."""
+    lookahead = len(cache_case.tokens) - 12
+    engine = cache_case.engine
+    assert engine.lookup(cache_case.tokens, lookup_id="A", pin=True) == 12
+    request = ReqMeta(
+        req_id="A",
+        token_ids=cache_case.tokens[:12],
+        lookahead_token_ids=cache_case.tokens[12:],
+        slot_mapping=torch.arange(12, dtype=torch.long),
+        load_spec=LoadSpec(0, 12, True),
+    )
+    connector = _CPUConnector([request], engine, "sync", lookahead)
+    connector.start_load_kv(MagicMock(attn_metadata=object()))
+    assert not connector.get_block_ids_with_load_errors()
+    _, starts, ends = cache_case.connector.batched_to_gpu.call_args.args
+    assert starts == [0, 4, 8] and ends == [4, 8, 12]
+    assert not engine.lookup_pins
+
+    # Invalidate the final hash window after a lookup, as with an expired entry.
+    request.lookahead_token_ids[-1] += 1000
+    connector.start_load_kv(MagicMock(attn_metadata=object()))
+    assert connector.get_block_ids_with_load_errors() == {2}
 
 
 @pytest.mark.parametrize("loading", ["sync", "async", "layerwise"])
