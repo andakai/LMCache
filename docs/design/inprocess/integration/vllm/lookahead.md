@@ -24,6 +24,12 @@ The worker appends the suffix only for key generation. Masks and GPU slots remai
 KV-sized; retrieve results are sliced back to the KV range before failed-block
 reporting. `BlockStored` events carry the following token window separately.
 
+For vLLM packed K/V layouts, the V2 GPU connector views its legacy `[2,L,T,D]`
+allocation as `[1,L,T,2*D]` for both transfer directions. The packed kernel uses
+one plane, so passing the legacy shape directly would copy only half the KV.
+HND transfers also convert the packed content width to a single K/V head width
+before calling the in-process kernel. The allocation size is unchanged.
+
 The versioned vLLM wrapper supplies resolved cache groups. Until separate proofs
 exist, H>0 rejects multiple groups, non-full attention, PP/CP, layerwise/Blend,
 and LMCache P/D. Prompt embeddings bypass external load/save. A terminal sample
