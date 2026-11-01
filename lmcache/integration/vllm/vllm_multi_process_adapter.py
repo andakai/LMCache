@@ -38,6 +38,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_KIND_REMOVED,
     KV_EVENT_KIND_STORED,
+    LOOKAHEAD_HASHES,
     BlockAllocationRecord,
     IPCCacheServerKey,
     KVEventBatch,
@@ -317,7 +318,7 @@ def get_experimental(
         timeout: Seconds to wait for the server's response.
 
     Returns:
-        Experimental features built into the server (now `transfer_query`).
+        Capabilities built into the server, including key-protocol support.
     """
     future = req_client.get_experimental()
     try:
@@ -711,6 +712,7 @@ class LMCacheMPSchedulerAdapter:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
         required_chunk_alignment: int | None = None,
+        num_hash_lookahead_tokens: int = 0,
     ):
         """
         Args:
@@ -733,7 +735,14 @@ class LMCacheMPSchedulerAdapter:
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             required_chunk_alignment: Optional model-derived chunk alignment
                 used to bind or validate the LMCache server chunk size.
+            num_hash_lookahead_tokens: Subsequent accepted tokens needed to
+                identify a chunk. Requires matching server support.
+
+        Raises:
+            ValueError: If lookahead is negative or a server lacks support.
         """
+        if num_hash_lookahead_tokens < 0:
+            raise ValueError("num_hash_lookahead_tokens must be nonnegative")
         (
             vllm_block_size,
             parallel_strategy,
@@ -763,6 +772,7 @@ class LMCacheMPSchedulerAdapter:
             ]
         self._mq_timeout = mq_timeout
         self._required_chunk_alignment = required_chunk_alignment
+        self._num_hash_lookahead_tokens = num_hash_lookahead_tokens
 
         # Submitted lookups until cleanup_lookup_result. Each keeps its result
         # once resolved, so repeated checks return the same value after the
@@ -794,6 +804,12 @@ class LMCacheMPSchedulerAdapter:
                 f"All LMCache servers must share the same chunk_size, got {chunk_sizes}"
             )
         self.lmcache_tokens_per_chunk = unique_sizes.pop()
+        if num_hash_lookahead_tokens:
+            for client in self.req_clients.values():
+                if LOOKAHEAD_HASHES not in get_experimental(client, self._mq_timeout):
+                    for current_client in self.req_clients.values():
+                        current_client.close()
+                    raise ValueError("LMCache server does not support lookahead hashes")
 
         if self.lmcache_tokens_per_chunk % vllm_block_size != 0:
             raise ValueError(
@@ -871,7 +887,11 @@ class LMCacheMPSchedulerAdapter:
     def _recover_server_chunk_size(
         self, server_url: str, req_client: RequestClient
     ) -> bool:
-        """Restore one server's chunk-size agreement before marking it healthy."""
+        """Verify chunk size and key capabilities before marking a server healthy."""
+        if self._num_hash_lookahead_tokens and LOOKAHEAD_HASHES not in get_experimental(
+            req_client, self._mq_timeout
+        ):
+            return False
         return _verify_recovered_chunk_size(
             req_client,
             self.lmcache_tokens_per_chunk,
@@ -935,7 +955,9 @@ class LMCacheMPSchedulerAdapter:
             return False
 
         lookup_tokens = max(
-            0, num_packed_tokens(packed_token_ids) - int(reserve_last_token)
+            0,
+            num_packed_tokens(packed_token_ids)
+            - max(int(reserve_last_token), self._num_hash_lookahead_tokens),
         )
         aligned_end = (
             lookup_tokens // self.lmcache_tokens_per_chunk
@@ -1199,6 +1221,7 @@ class LMCacheMPSchedulerAdapter:
             world_size=self.world_size,
             worker_id=None,
             token_bytes=token_bytes,
+            num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             start=start,
             end=end,
             request_id=request_id,
@@ -1250,6 +1273,7 @@ class LMCacheMPWorkerAdapter:
         extra_config: dict[str, Any] | None = None,
         enable_kv_events: bool = False,
         required_chunk_alignment: int | None = None,
+        num_hash_lookahead_tokens: int = 0,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1274,12 +1298,17 @@ class LMCacheMPWorkerAdapter:
                 for vLLM's KV event publisher.
             required_chunk_alignment: Optional model-derived chunk alignment
                 used to bind or validate the LMCache server chunk size.
+            num_hash_lookahead_tokens: Subsequent accepted tokens needed to
+                identify a chunk. Requires matching server support.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
-            ValueError: If enabled auto-start configuration is invalid.
+            ValueError: If auto-start configuration or lookahead is invalid,
+                or the server lacks the required key-protocol support.
             ConnectionError: If auto-start fails or the MP server handshake fails.
         """
+        if num_hash_lookahead_tokens < 0:
+            raise ValueError("num_hash_lookahead_tokens must be nonnegative")
         (
             vllm_block_size,
             parallel_strategy,
@@ -1336,6 +1365,7 @@ class LMCacheMPWorkerAdapter:
         self._mq_timeout = mq_timeout
         self._server_url = server_url
         self._required_chunk_alignment = required_chunk_alignment
+        self._num_hash_lookahead_tokens = num_hash_lookahead_tokens
 
         # Instance id for GPU worker. uuid4-derived (OS entropy) rather
         # than os.getpid() to avoid collision in containerized deployments.
@@ -1438,6 +1468,9 @@ class LMCacheMPWorkerAdapter:
         self.experimental: set[str] = get_experimental(
             self.req_client, timeout=self._mq_timeout
         )
+        if num_hash_lookahead_tokens and LOOKAHEAD_HASHES not in self.experimental:
+            self.req_client.close()
+            raise ValueError("LMCache server does not support lookahead hashes")
         self._resolve_kv_event_source(enable_kv_events, parallel_strategy)
         self.dispatcher: "Dispatcher | None" = None
 
@@ -1660,6 +1693,11 @@ class LMCacheMPWorkerAdapter:
         # Skip all recovery RPCs if shutdown already requested a stop.
         if self._heartbeat_stop_requested():
             logger.info("Heartbeat stop requested; skipping server recovery")
+            return False
+
+        if self._num_hash_lookahead_tokens and LOOKAHEAD_HASHES not in get_experimental(
+            self.req_client, self._mq_timeout
+        ):
             return False
 
         if not _verify_recovered_chunk_size(
@@ -2358,6 +2396,7 @@ class LMCacheMPWorkerAdapter:
         hashes = self._kv_event_hasher.compute_packed_chunk_hashes(
             key.token_bytes,
             end=key.end,
+            num_hash_lookahead_tokens=key.num_hash_lookahead_tokens,
         )
         start_chunk = key.start // chunk_size
         end_chunk = key.end // chunk_size
@@ -2383,6 +2422,20 @@ class LMCacheMPWorkerAdapter:
                     lora_id=None,
                     medium="CPU",
                     lora_name=None,
+                    lookahead_token_ids=(
+                        [
+                            unpack_token_ids(
+                                key.token_bytes[
+                                    end * TOKEN_STRIDE : (
+                                        end + key.num_hash_lookahead_tokens
+                                    )
+                                    * TOKEN_STRIDE
+                                ]
+                            )
+                        ]
+                        if key.num_hash_lookahead_tokens
+                        else None
+                    ),
                 )
             )
             parent_hash = block_hash
@@ -2524,6 +2577,11 @@ class LMCacheMPWorkerAdapter:
                         block_hashes=list(hashes),
                         parent_block_hash=record.parent_block_hash,
                         token_ids=list(record.token_ids),
+                        lookahead_token_ids=(
+                            [list(record.lookahead_token_ids) for _ in hashes]
+                            if record.lookahead_token_ids
+                            else None
+                        ),
                         block_size=self.lmcache_tokens_per_chunk,
                         lora_id=None,
                         medium=record.medium,
@@ -2589,6 +2647,7 @@ class LMCacheMPWorkerAdapter:
             world_size=self.world_size,
             worker_id=self.worker_id,
             token_bytes=token_bytes,
+            num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             start=start,
             end=end,
             request_id=request_id,

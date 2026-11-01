@@ -1217,6 +1217,14 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     "token_chunks": token_chunks,
                     "token_offsets": token_offsets,
                     "parent_hashes": parent_hashes,
+                    "lookahead_token_chunks": [
+                        token_ids[
+                            offset + chunk_size : offset
+                            + chunk_size
+                            + key.num_hash_lookahead_tokens
+                        ]
+                        for offset in token_offsets
+                    ],
                 },
             )
         )

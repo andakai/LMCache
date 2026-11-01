@@ -9,12 +9,69 @@ import numpy as np
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess.token_codec import pack_token_ids
 from lmcache.v1.multiprocess.token_hasher import (
     TokenHasher,
     chunk_hash_windows_numba,
     rolling_hash_windows_numba,
     update_table_id_numba,
 )
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 5])
+@pytest.mark.parametrize("num_tokens", [0, 3, 4, 5, 8, 9, 13])
+def test_lookahead_hash_boundaries(lookahead: int, num_tokens: int) -> None:
+    hasher = TokenHasher(chunk_size=4)
+    tokens = list(range(num_tokens))
+    unpacked = hasher.compute_chunk_hashes(tokens, num_hash_lookahead_tokens=lookahead)
+    packed = hasher.compute_packed_chunk_hashes(
+        pack_token_ids(tokens), num_hash_lookahead_tokens=lookahead
+    )
+    assert packed == unpacked
+    assert len(packed) == max(0, num_tokens - lookahead) // 4
+
+
+@pytest.mark.parametrize("lookahead", [1, 5])
+def test_lookahead_dependencies_and_kv_range(lookahead: int) -> None:
+    hasher = TokenHasher(chunk_size=4)
+    tokens = list(range(12 + lookahead))
+    hashes = hasher.compute_chunk_hashes(tokens, num_hash_lookahead_tokens=lookahead)
+    # The second chunk needs tokens beyond its KV range, including past end.
+    selected = hasher.compute_packed_chunk_hashes(
+        pack_token_ids(tokens),
+        start=4,
+        end=8,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    assert selected == hashes[1:2]
+    tokens[8 + lookahead - 1] += 100
+    changed = hasher.compute_chunk_hashes(tokens, num_hash_lookahead_tokens=lookahead)
+    assert changed[0] == hashes[0]
+    assert changed[1] != hashes[1]
+    assert changed[2] != hashes[2]
+
+
+def test_lookahead_schemas_do_not_alias() -> None:
+    tokens = [7] * 20
+    hashes = {
+        TokenHasher(chunk_size=chunk_size).compute_chunk_hashes(
+            tokens, num_hash_lookahead_tokens=lookahead
+        )[0]
+        for chunk_size, lookahead in [(4, 0), (4, 1), (4, 5), (8, 1)]
+    }
+    assert len(hashes) == 4
+    hasher = TokenHasher(chunk_size=4)
+    assert hasher.compute_chunk_hashes(tokens, num_hash_lookahead_tokens=0) == (
+        hasher.compute_chunk_hashes(tokens)
+    )
+
+
+def test_negative_lookahead_rejected() -> None:
+    hasher = TokenHasher(chunk_size=4)
+    with pytest.raises(ValueError, match="nonnegative"):
+        hasher.compute_chunk_hashes([1, 2, 3, 4], num_hash_lookahead_tokens=-1)
+    with pytest.raises(ValueError, match="nonnegative"):
+        hasher.compute_packed_chunk_hashes(b"", num_hash_lookahead_tokens=-1)
 
 
 @pytest.fixture

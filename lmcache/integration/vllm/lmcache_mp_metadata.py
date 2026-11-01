@@ -306,6 +306,7 @@ class LMCacheMPRequestMetadata:
         group_tokens_per_block: list[int],
         *,
         save_decode_cache: bool = False,
+        num_hash_lookahead_tokens: int = 0,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -321,6 +322,9 @@ class LMCacheMPRequestMetadata:
             save_decode_cache: Whether to store chunks containing generated
                 tokens. Defaults to storing only complete chunks within the
                 initial prompt, including when decode fills its partial tail.
+            num_hash_lookahead_tokens: Accepted tokens required beyond a
+                chunk's KV range to identify it. Kept in the packed tokens
+                sent to the server, even though they are not transferred KV.
 
         Returns:
             Metadata for newly storable chunks, or None when no complete
@@ -371,7 +375,7 @@ class LMCacheMPRequestMetadata:
             default=0,
         )
         min_available_tokens = min(
-            len(tracker.all_token_ids),
+            max(0, len(tracker.all_token_ids) - num_hash_lookahead_tokens),
             allocated_tokens,
             computed_tokens,
         )

@@ -759,6 +759,9 @@ class CacheStoreEvent:
     medium: str | None
     lora_name: str | None
 
+    # Hash dependency tokens beyond each block, absent for legacy hashing.
+    lookahead_token_ids: list[list[int]] | None = None
+
 
 @dataclass
 class CacheRemoveEvent:

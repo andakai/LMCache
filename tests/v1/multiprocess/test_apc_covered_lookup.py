@@ -24,7 +24,7 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import LOOKAHEAD_HASHES, IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 
@@ -32,7 +32,43 @@ from lmcache.v1.multiprocess.token_codec import pack_token_ids
 from tests.v1.mp_scheduler_adapter_test_utils import (
     make_request_client,
     make_scheduler_adapter,
+    ready_future,
 )
+
+
+@pytest.mark.parametrize("lookahead", [1, 5])
+def test_lookup_reserves_hash_dependencies(monkeypatch, lookahead: int) -> None:
+    client = make_request_client(CHUNK_SIZE)
+    client.get_experimental.return_value = ready_future([LOOKAHEAD_HASHES])
+    adapter = make_scheduler_adapter(
+        monkeypatch,
+        {"u": client},
+        CHUNK_SIZE,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    tokens = list(range(2 * CHUNK_SIZE + lookahead - 1))
+    assert adapter.maybe_submit_lookup_request(
+        "req",
+        pack_token_ids(tokens),
+        reserve_last_token=True,
+    )
+    key = client.lookup.call_args.args[0]
+    assert key.end == CHUNK_SIZE
+    assert key.num_tokens == len(tokens)
+    assert key.num_hash_lookahead_tokens == lookahead
+    adapter.shutdown()
+
+
+def test_lookup_rejects_server_without_lookahead(monkeypatch) -> None:
+    client = make_request_client(CHUNK_SIZE)
+    client.get_experimental.return_value = ready_future([])
+    with pytest.raises(ValueError, match="does not support lookahead"):
+        make_scheduler_adapter(
+            monkeypatch, {"u": client}, CHUNK_SIZE, num_hash_lookahead_tokens=1
+        )
+    client.lookup.assert_not_called()
+    client.close.assert_called_once()
+
 
 CHUNK_SIZE = 16
 

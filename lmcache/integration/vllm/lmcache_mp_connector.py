@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+import hashlib
 import math
 import sys
 import time
@@ -118,6 +119,7 @@ except ImportError:
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.config import KVTransferConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
         KVConnectorPromMetrics,
         KVConnectorStats,
@@ -580,6 +582,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # appends. The scheduler role sets it from the vLLM config.
     _mamba_relocation_window: int = 0
 
+    @classmethod
+    def supports_lookahead_block_hashes(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Declare lookahead compatibility; initialization verifies server support.
+
+        Args:
+            kv_transfer_config: vLLM connector configuration.
+
+        Returns:
+            True for the MP key protocol implemented by this connector.
+        """
+        return True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -625,6 +641,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config, kv_cache_config
         )
         cache_model_name = get_dcp_decorated_model_name(vllm_config, kv_cache_config)
+        self._num_hash_lookahead_tokens = getattr(
+            vllm_config, "num_hash_lookahead_tokens", 0
+        )
+        if self._num_hash_lookahead_tokens:
+            spec = vllm_config.speculative_config
+            assert spec is not None
+            parallel = vllm_config.parallel_config
+            # Scheduler groups can collapse UniformTypeKVCacheSpecs and PP
+            # workers own different layers. Use the shared config identity.
+            namespace = hashlib.sha256(
+                repr(
+                    (
+                        "lmcache-lookahead-v1",
+                        vllm_config.model_config.compute_hash(),
+                        spec.method,
+                        spec.compute_hash(),
+                        (
+                            parallel.tensor_parallel_size,
+                            parallel.pipeline_parallel_size,
+                            parallel.decode_context_parallel_size,
+                            parallel.prefill_context_parallel_size,
+                        ),
+                        vllm_config.cache_config.compute_hash(),
+                        get_group_tokens_per_block(vllm_config, kv_cache_config),
+                        self._num_hash_lookahead_tokens,
+                    )
+                ).encode()
+            ).hexdigest()
+            cache_model_name += f"-lookahead-v1-{namespace}"
 
         assert vllm_config.kv_transfer_config is not None
         self._can_store = vllm_config.kv_transfer_config.is_kv_producer
@@ -758,6 +803,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
                 required_chunk_alignment=scheduler_block_size,
+                num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
             # Worker events aggregated per step, awaiting take_events().
@@ -792,6 +838,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
                 enable_kv_events=self._enable_kv_events,
                 required_chunk_alignment=scheduler_block_size,
+                num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             )
             # Whether vLLM called get_kv_connector_kv_cache_events this step; it
             # never does for a MultiConnector child (see build_connector_worker_meta).
@@ -1226,6 +1273,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     block_size=event.block_size,
                     medium=event.medium,
                     lora_name=event.lora_name,
+                    **(
+                        {"lookahead_token_ids": event.lookahead_token_ids}
+                        if event.lookahead_token_ids is not None
+                        else {}
+                    ),
                 )
             )
         kv_events = LMCacheMPKVEvents(num_workers=1)
@@ -1850,6 +1902,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
                 save_decode_cache=self._save_decode_cache,
+                num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1892,6 +1945,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
                 save_decode_cache=self._save_decode_cache,
+                num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
             )
 
             if r_meta is not None:

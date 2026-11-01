@@ -76,6 +76,7 @@ def make_scheduler_adapter(
     clients: dict[str, MagicMock],
     vllm_block_size: int,
     model_name: str = "test_model",
+    num_hash_lookahead_tokens: int = 0,
 ) -> LMCacheMPSchedulerAdapter:
     """Construct a scheduler adapter backed by ``clients``.
 
@@ -85,6 +86,7 @@ def make_scheduler_adapter(
         clients: Request client of every server, keyed by server URL.
         vllm_block_size: vLLM block size; must divide the servers' chunk size.
         model_name: Model name carried in every key.
+        num_hash_lookahead_tokens: Required dependency length for chunk hashes.
 
     Returns:
         The adapter, with one TP rank and one pipeline stage.
@@ -106,4 +108,5 @@ def make_scheduler_adapter(
             pp_size=1,
             n_servers=len(clients),
         ),
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
     )

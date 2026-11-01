@@ -21,6 +21,7 @@ message KVEventRecord {
   repeated bytes block_hashes = 5;
   optional bytes parent_block_hash = 6;
   repeated int64 token_ids = 7;
+  repeated int64 lookahead_token_ids = 8;
 }
 
 message KVEventBatch {

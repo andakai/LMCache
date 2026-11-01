@@ -93,7 +93,7 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         self._kv_event_dropped = self._kv_event_lost_markers = 0
         self._kv_event_unbound_stores = 0
         self._kv_event_bindings: OrderedDict[
-            bytes, tuple[tuple[int, ...], bytes | None]
+            bytes, tuple[tuple[int, ...], bytes | None, tuple[int, ...]]
         ] = OrderedDict()
         if not self._kv_events_enabled:
             return
@@ -263,6 +263,7 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         hashes: list[bytes],
         parent: bytes | None = None,
         tokens: Sequence[int] = (),
+        lookahead_tokens: Sequence[int] = (),
     ) -> None:
         """Append a sequenced record while holding the event lock."""
         self._kv_event_log.append(
@@ -274,6 +275,7 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                 block_hashes=hashes,
                 parent_block_hash=parent,
                 token_ids=list(tokens),
+                lookahead_token_ids=list(lookahead_tokens),
             )
         )
         self._kv_event_next_seq += 1
@@ -292,13 +294,21 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         """Translate bus events to ordered records; token bindings precede writes."""
         with self._kv_event_lock:
             if event.event_type == EventType.MP_TOKENS:
-                for chunk_hash, tokens, parent in zip(
+                for chunk_hash, tokens, parent, lookahead in zip(
                     event.metadata["chunk_hashes"],
                     event.metadata["token_chunks"],
                     event.metadata["parent_hashes"],
+                    event.metadata.get(
+                        "lookahead_token_chunks",
+                        [()] * len(event.metadata["chunk_hashes"]),
+                    ),
                     strict=True,
                 ):
-                    self._kv_event_bindings[chunk_hash] = (tuple(tokens), parent)
+                    self._kv_event_bindings[chunk_hash] = (
+                        tuple(tokens),
+                        parent,
+                        tuple(lookahead),
+                    )
                     self._kv_event_bindings.move_to_end(chunk_hash)
                 if len(self._kv_event_bindings) > _TOKEN_BINDING_CACHE_SIZE:
                     while len(self._kv_event_bindings) > _TOKEN_BINDING_CACHE_SIZE // 2:
@@ -319,11 +329,12 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                     if binding is None:
                         self._kv_event_unbound_stores += 1
                         continue
-                    tokens, parent = binding
+                    tokens, parent, lookahead = binding
                     self._append_kv_event(
                         KV_EVENT_KIND_STORED,
                         model_name,
                         [chunk_hash],
                         parent,
                         tokens,
+                        lookahead,
                     )

@@ -80,12 +80,24 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # Subsequent tokens needed to identify each chunk's KV, outside [start, end).
+    # Clients must negotiate support before using a nonzero value.
+    num_hash_lookahead_tokens: int = 0
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
     _SALT_MAX_LEN = 128
 
     def __post_init__(self) -> None:
+        if self.num_hash_lookahead_tokens < 0:
+            raise ValueError("num_hash_lookahead_tokens must be nonnegative")
+        if (
+            self.num_hash_lookahead_tokens
+            and self.end > 0
+            and self.end + self.num_hash_lookahead_tokens > self.num_tokens
+        ):
+            raise ValueError("IPC key lacks the lookahead tokens required by end")
         if len(self.token_bytes) % TOKEN_STRIDE:
             raise ValueError(
                 f"token_bytes of {len(self.token_bytes)} byte(s) is not a "
@@ -115,6 +127,7 @@ class IPCCacheServerKey:
         cache_salt: str = "",
         num_kv_readers: int = 1,
         request_configs: dict[str, Any] | None = None,
+        num_hash_lookahead_tokens: int = 0,
     ) -> "IPCCacheServerKey":
         """Create a key from unpacked token ids.
 
@@ -132,6 +145,9 @@ class IPCCacheServerKey:
             cache_salt: Per-user isolation salt.
             num_kv_readers: Number of workers that will read the object.
             request_configs: Optional LMCache request configs.
+            num_hash_lookahead_tokens: Subsequent token dependencies beyond
+                each stored chunk. The token sequence must cover end plus
+                this length when it is nonzero.
 
         Returns:
             The key, with ``token_ids`` packed into ``token_bytes``.
@@ -147,6 +163,7 @@ class IPCCacheServerKey:
             request_id=request_id,
             cache_salt=cache_salt,
             request_configs=request_configs,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
 
     @property
@@ -184,6 +201,7 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             request_configs=self.request_configs,
+            num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
         )
 
 
@@ -413,6 +431,7 @@ def get_customized_decoder(type: Any) -> msgspec.msgpack.Decoder:
 # server module (lmcache.v1.multiprocess.plugin_modules.qstore); the vLLM
 # connector requests it for ``lmcache.mp.transfer_intermediate_tensors``.
 TRANSFER_QUERY = "transfer_query"
+LOOKAHEAD_HASHES = "lookahead_hashes_v1"
 KV_EVENT_KIND_STORED = "stored"
 KV_EVENT_KIND_REMOVED = "removed"
 KV_EVENT_MEDIUM_CPU = "CPU"
@@ -429,6 +448,8 @@ class KVEventRecord:
     block_hashes: list[bytes]
     parent_block_hash: bytes | None
     token_ids: list[int]
+    # One stored chunk per record; these tokens are outside its KV range.
+    lookahead_token_ids: list[int] = field(default_factory=list)
 
 
 @dataclass

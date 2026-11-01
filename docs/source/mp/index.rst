@@ -44,6 +44,30 @@ Prerequisites
 Server Variants
 ---------------
 
+Speculative lookahead
+~~~~~~~~~~~~~~~~~~~~~
+
+The vLLM MP connector supports core lookahead hashes with a matching LMCache
+server. When a chunk depends on H subsequent accepted tokens, lookup and store
+wait until those tokens are known. The tokens identify the chunk but are not
+part of its transferred KV. A final chunk whose dependency becomes known only
+at request completion may remain unstored; the connector does not queue a new
+finish-time store.
+
+Both client and server must support ``lookahead_hashes_v1``. The client checks
+this at initialization and after server recovery. Old servers and CacheBlend
+do not advertise this capability: use a compatible server, or set vLLM's
+``disable_lookahead_block_hashes`` speculative option to ``true`` to retain
+the legacy path. Do not mix client/server builds while lookahead is enabled.
+
+Positive-lookahead keys use a separate model/draft-configuration namespace and
+hash schema, so they do not reuse legacy entries. H=0 preserves legacy keys.
+KV events carry dependency tokens separately from the stored chunk's tokens.
+This applies to MP mode; it does not enable the separate in-process connector.
+
+Entry points
+~~~~~~~~~~~~
+
 LMCache ships two server entry points:
 
 .. list-table::
