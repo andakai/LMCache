@@ -18,7 +18,7 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.v1.gpu_connector.utils import get_dtype
+from lmcache.v1.gpu_connector.utils import LayoutHints, get_dtype
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
@@ -96,6 +96,84 @@ def patch_pin_allocator():
         ),
     ):
         yield
+
+
+@pytest.mark.parametrize("use_gpu", [True, False])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("version", [2, 3])
+def test_packed_kv_transfer(use_gpu: bool, layout: str, version: int) -> None:
+    """Copy both K and V exactly, including strided blocks and partial chunks."""
+    nb, nl, bs, nh, hs, chunk_size = 5, 3, 16, 4, 32, 16
+    device = torch.device("cuda", torch.cuda.current_device())
+    shape = (nb, nl, bs, nh, 2 * hs)
+    if layout == "HND":
+        shape = (nb, nl, nh, bs, 2 * hs)
+    pool = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    original = pool.clone()
+    layers = list(pool.unbind(1))
+    hints: LayoutHints = {"kv_layout": "HND" if layout == "HND" else "NHD"}
+    metadata = LMCacheMetadata(
+        model_name="packed-transfer",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=pool.dtype,
+        kv_shape=(nl, 2, chunk_size, nh, hs),
+        chunk_size=chunk_size,
+    )
+    connector_cls = (
+        VLLMPagedMemGPUConnectorV2 if version == 2 else VLLMPagedMemGPUConnectorV3
+    )
+    connector = connector_cls.from_metadata(
+        metadata, use_gpu=use_gpu, device=device, layout_hints=hints
+    )
+    allocator = TensorMemoryAllocator(
+        torch.empty(1024 * 1024, dtype=torch.uint8, pin_memory=True)
+    )
+    for num_tokens in (chunk_size, 7):
+        pool.copy_(original)
+        slots = torch.randperm(nb * bs, device=device)[:num_tokens]
+        obj_shape = (
+            torch.Size([2, nl, num_tokens, nh * hs])
+            if version == 2
+            else torch.Size([1, nl, num_tokens, nh * 2 * hs])
+        )
+        memory_obj = allocator.allocate(obj_shape, pool.dtype)
+        assert memory_obj is not None
+        torch.cuda.synchronize()
+        connector.from_gpu(
+            memory_obj, 0, num_tokens, kvcaches=layers, slot_mapping=slots
+        )
+        reference = original
+        if layout == "HND":
+            reference = original.permute(0, 1, 3, 2, 4)
+        token_major = reference.permute(1, 0, 2, 3, 4).reshape(nl, nb * bs, -1)
+        expected = token_major[:, slots].cpu()
+        stored = memory_obj.get_tensor(0)
+        assert stored is not None
+        torch.testing.assert_close(
+            stored.view(nl, num_tokens, -1), expected, rtol=0, atol=0
+        )
+
+        pool.fill_(-1)
+        torch.cuda.synchronize()
+        connector.batched_to_gpu(
+            [memory_obj],
+            [0],
+            [num_tokens],
+            kvcaches=layers,
+            slot_mapping=slots,
+            vllm_cached_tokens=3,
+        )
+        expected_pool = torch.full_like(original, -1)
+        block_ids, offsets = slots[3:] // bs, slots[3:] % bs
+        if layout == "HND":
+            expected_pool[block_ids, :, :, offsets] = original[block_ids, :, :, offsets]
+        else:
+            expected_pool[block_ids, :, offsets] = original[block_ids, :, offsets]
+        torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
+        memory_obj.ref_count_down()
 
 
 @pytest.mark.parametrize("use_gpu", [True, False])
