@@ -533,6 +533,7 @@ class LMCacheConnectorV1Impl:
         self.num_hash_lookahead_tokens = getattr(
             vllm_config, "num_hash_lookahead_tokens", 0
         )
+        kv_block_size = vllm_config.cache_config.block_size
         if self.num_hash_lookahead_tokens:
             # Third Party
             from vllm.v1.kv_cache_interface import FullAttentionSpec, iter_layer_specs
@@ -544,6 +545,7 @@ class LMCacheConnectorV1Impl:
                 )
             if kv_cache_config is None or len(kv_cache_config.kv_cache_groups) != 1:
                 raise ValueError("LMCache V1 lookahead requires one resolved KV group")
+            kv_block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
             if not all(
                 isinstance(spec, FullAttentionSpec)
                 and spec.sliding_window is None
@@ -574,7 +576,7 @@ class LMCacheConnectorV1Impl:
         self._manager.start_services()
 
         # Initialize connector-specific state
-        self._init_connector_state(role, vllm_config, config)
+        self._init_connector_state(role, vllm_config, config, kv_block_size)
 
         # Setup metrics for monitoring data structures
         self._setup_metrics()
@@ -610,6 +612,7 @@ class LMCacheConnectorV1Impl:
         role: KVConnectorRole,
         vllm_config: "VllmConfig",
         config: LMCacheEngineConfig,
+        kv_block_size: int,
     ) -> None:
         """Initialize connector-specific state variables."""
         self.async_loading = config.enable_async_loading
@@ -644,7 +647,7 @@ class LMCacheConnectorV1Impl:
         self._check_legacy_register_kv_caches()
 
         self.kv_caches: dict[str, torch.Tensor] = {}
-        self._block_size = vllm_config.cache_config.block_size
+        self._block_size = kv_block_size
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}

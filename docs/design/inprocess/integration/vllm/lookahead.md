@@ -20,6 +20,10 @@ previously saved decode KV retains its full hash context even when new decode
 saves are disabled. No finish-time save is scheduled from `num_computed_tokens`:
 the async-load failure case must not publish uninitialized KV.
 
+Physical slot addresses use the resolved single-group block size, which can
+differ from the requested cache block size. LMCache chunk boundaries remain
+independent of those allocation units.
+
 The worker appends the suffix only for key generation. Masks and GPU slots remain
 KV-sized; retrieve results are sliced back to the KV range before failed-block
 reporting. `BlockStored` events carry the following token window separately.

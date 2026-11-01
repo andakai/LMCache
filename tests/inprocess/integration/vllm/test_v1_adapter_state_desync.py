@@ -21,6 +21,7 @@ locks in that behavior by feeding ``wait_for_save`` a request whose
 
 # Standard
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 import logging
 
 # Third Party
@@ -29,7 +30,16 @@ import torch
 
 pytest.importorskip("vllm")
 
+# Third Party
+from vllm.config import KVTransferConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.request import Request
+
 # First Party
+from lmcache.inprocess.integration.vllm import vllm_v1_adapter as adapter
 from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
@@ -38,6 +48,67 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     SaveSpec,
 )
+from lmcache.inprocess.v1.config import LMCacheEngineConfig
+
+
+@pytest.mark.parametrize("resolved_block_size", [16, 32, 64])
+def test_scheduler_slots_use_resolved_kv_group_block_size(
+    monkeypatch: pytest.MonkeyPatch, resolved_block_size: int
+) -> None:
+    """Allocator block IDs must map to physical KV slots, not CLI block units."""
+    config = LMCacheEngineConfig.from_defaults(chunk_size=16)
+    monkeypatch.setattr(adapter, "lmcache_get_or_create_config", lambda: config)
+    monkeypatch.setattr(adapter, "VllmServiceFactory", MagicMock())
+    manager = MagicMock(lmcache_engine=None, lmcache_engine_metadata=None)
+    monkeypatch.setattr(adapter, "LMCacheManager", MagicMock(return_value=manager))
+    monkeypatch.setattr(adapter.LMCStatsMonitor, "GetOrCreate", MagicMock())
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="LMCacheConnectorV1", kv_role="kv_both"
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(get_num_layers=lambda _: 1),
+        num_hash_lookahead_tokens=1,
+    )
+    spec = FullAttentionSpec(
+        block_size=resolved_block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    connector = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        MagicMock(),
+        SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]),
+    )
+    request = Request(
+        "resolved-slots",
+        list(range(resolved_block_size + 1)),
+        SamplingParams(max_tokens=1),
+        None,
+    )
+    connector.update_state_after_alloc(request, 0)
+    metadata = connector.build_connector_meta(
+        SimpleNamespace(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[NewRequestData.from_request(request, ([2],))],
+            num_scheduled_tokens={request.request_id: resolved_block_size},
+            scheduled_cached_reqs=[],
+        )
+    )
+    assert len(metadata.requests) == 1
+    assert metadata.requests[0].slot_mapping.tolist() == list(
+        range(2 * resolved_block_size, 3 * resolved_block_size)
+    )
+    assert metadata.requests[0].lookahead_token_ids == [resolved_block_size]
 
 
 @pytest.mark.parametrize("lookahead", [1, 3, 17])
