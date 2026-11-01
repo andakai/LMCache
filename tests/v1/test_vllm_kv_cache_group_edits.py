@@ -36,6 +36,11 @@ import sys
 import pytest
 import torch
 
+# First Party
+from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.kv_format import detect_format
+from lmcache.v1.gpu_connector.kv_format.specs import get_spec
+
 # One registered cache value, mirroring the module's own ``RegisteredKVCache``:
 # a paged KV tensor, or ``[conv_state, ssm_state]`` for Mamba layers.
 _RegisteredKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
@@ -364,6 +369,29 @@ def test_subpaged_edit_preserves_byte_order(edits, make_cache):
     )
 
 
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND", "BLNHC", "BLHNC"])
+def test_opaque_pages_preserve_geometry_through_format_detection(edits, kv_layout):
+    """Layout hints must describe edited pages as well as unedited tensors."""
+    config, caches = _hybrid_config(_fused_kv_cache())
+    hints = {"kv_layout": kv_layout}
+    edited = edits.apply_kv_cache_group_edits(config, caches, layout_hints=hints)
+    for name, tensor in edited.items():
+        fmt, normalized = detect_format([tensor], EngineType.VLLM, hints)
+        geometry = get_spec(normalized, fmt)
+        assert geometry.block_size() == LOGICAL_BLOCK_SIZE
+        assert geometry.num_heads() == 1
+        assert geometry.num_blocks() == NUM_LOGICAL_BLOCKS
+        # Synthetic axes may change, but the bytes of each logical page may not.
+        original = caches[name][0] if isinstance(caches[name], list) else caches[name]
+        assert (
+            tensor.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
+        )
+        for block in range(NUM_LOGICAL_BLOCKS):
+            torch.testing.assert_close(
+                normalized[0][block].flatten(), tensor[block].flatten()
+            )
+
+
 @pytest.mark.parametrize("make_cache", [_fused_kv_cache, _split_kv_cache])
 def test_subpaged_edit_groups_contiguous_kernel_pages(edits, make_cache):
     """Logical block ``n`` must cover kernel pages ``n*k .. n*k+k-1``.
@@ -407,11 +435,8 @@ def test_subpaged_edit_rejects_permuted_split_registration(edits):
     """A permuted rank-5 tensor must fail loudly rather than be re-viewed.
 
     vLLM <= 0.25.x under HND registers rank 5 with stride order
-    ``(0, 1, 3, 2, 4)``. Re-viewing it in memory order would succeed and then
-    be misread downstream -- the edited view is NHD-shaped, so the HND
-    detector branch reads its block size from the synthetic ``num_heads`` axis
-    and resolves 1. This rule's whole purpose is to prevent a silently wrong
-    block size, so it must not introduce one.
+    ``(0, 1, 3, 2, 4)``. The rank-5 path does not normalize memory order;
+    keep its existing rejection contract separate from rank-4 support.
     """
     physical = torch.zeros(
         NUM_KERNEL_PAGES,
