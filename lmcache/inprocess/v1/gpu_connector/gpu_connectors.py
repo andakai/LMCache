@@ -591,6 +591,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
+            memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
             device_ops.multi_layer_kv_transfer(
                 memory_obj_tensor,
                 kv_cache_pointer,
@@ -623,6 +624,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 ):
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
+                    memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
                     device_ops.multi_layer_kv_transfer(
                         memory_obj_tensor,
                         kv_cache_pointer,
@@ -656,6 +658,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
+                    memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
                     memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
         if not memory_obj.raw_tensor.is_cuda:
@@ -679,6 +682,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         raise NotImplementedError
+
+    def _transfer_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Normalize allocations made before packed layer groups were discovered."""
+        if get_spec_class(self.engine_kv_format).is_fused_packed:
+            return tensor.view(1, tensor.shape[1], tensor.shape[2], -1)
+        return tensor
 
 
 class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
