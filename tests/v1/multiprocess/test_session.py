@@ -16,6 +16,34 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import PeriodicThreadRegistry
 
 
+@pytest.mark.parametrize("lookahead", [1, 5])
+def test_incremental_lookahead_session(lookahead: int) -> None:
+    hasher = TokenHasher(chunk_size=4)
+    session = Session(request_id="lookahead", hasher=hasher)
+    tokens = list(range(12 + lookahead))
+    session.set_tokens(
+        pack_token_ids(tokens[: 8 + lookahead - 1]),
+        num_hash_lookahead_tokens=lookahead,
+    )
+    first = session.get_hashes(0)
+    assert len(first) == 1
+    with pytest.raises(ValueError, match="exceeds"):
+        session.get_hashes(0, 8)
+    session.set_tokens(pack_token_ids(tokens), num_hash_lookahead_tokens=lookahead)
+    expected = hasher.compute_chunk_hashes(tokens, num_hash_lookahead_tokens=lookahead)
+    assert session.get_hashes(0, 12) == expected
+    assert session.get_hashes(4, 12) == expected[1:]
+    assert first == expected[:1]
+    tokens[-1] += 1
+    session.set_tokens(pack_token_ids(tokens), num_hash_lookahead_tokens=lookahead)
+    changed = session.get_hashes(0, 12)
+    assert changed[:-1] == expected[:-1]
+    assert changed[-1] != expected[-1]
+    # A changed hash schema cannot reuse the cached chain.
+    session.set_tokens(pack_token_ids(tokens))
+    assert session.get_hashes(0, 12) == hasher.compute_chunk_hashes(tokens, end=12)
+
+
 @pytest.fixture
 def hasher() -> TokenHasher:
     """TokenHasher with small chunk_size for testing."""

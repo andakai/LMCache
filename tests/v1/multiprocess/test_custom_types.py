@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import replace
 from multiprocessing import Queue
 from typing import Any
 import multiprocessing as mp
@@ -17,6 +18,44 @@ from lmcache.v1.multiprocess.custom_types import (
     get_customized_decoder,
     get_customized_encoder,
 )
+
+
+def test_lookahead_key_roundtrip() -> None:
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="test",
+        world_size=1,
+        worker_id=0,
+        token_ids=list(range(9)),
+        end=8,
+        num_hash_lookahead_tokens=1,
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(key), type=IPCCacheServerKey
+    )
+    assert decoded == key
+    assert decoded.no_worker_id_version().num_hash_lookahead_tokens == 1
+    assert key != replace(key, num_hash_lookahead_tokens=0)
+    with pytest.raises(ValueError, match="lookahead tokens"):
+        replace(key, num_hash_lookahead_tokens=2)
+    with pytest.raises(ValueError, match="nonnegative"):
+        replace(key, num_hash_lookahead_tokens=-1)
+
+
+def test_legacy_ipc_payload_defaults_to_zero_lookahead() -> None:
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="test",
+        world_size=1,
+        worker_id=0,
+        token_ids=list(range(8)),
+        end=8,
+    )
+    payload = msgspec.msgpack.decode(msgspec.msgpack.encode(key))
+    del payload["num_hash_lookahead_tokens"]
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(payload), type=IPCCacheServerKey
+    )
+    assert decoded == key
+    assert decoded.num_hash_lookahead_tokens == 0
 
 
 def _get_cuda_ipc_wrapper():

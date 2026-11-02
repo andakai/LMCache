@@ -46,6 +46,8 @@ class Session:
     chunk_hashes: list = field(default_factory=list)
     last_prefix_hash: Any = None
     num_chunks_processed: int = 0
+    # Subsequent tokens required by every cached chunk hash.
+    num_hash_lookahead_tokens: int = 0
     created_at: float = field(default_factory=time.time)
     lookup_ipc_key: Optional[IPCCacheServerKey] = None
     prefetch_hit_chunks: int = -1
@@ -59,14 +61,37 @@ class Session:
     )
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def set_tokens(self, packed_token_ids: bytes) -> None:
+    def set_tokens(
+        self, packed_token_ids: bytes, *, num_hash_lookahead_tokens: int = 0
+    ) -> None:
         """Update the token sequence (idempotent, replaces not extends).
 
         Args:
             packed_token_ids: Complete packed token sequence, starting at
                 position 0.
+            num_hash_lookahead_tokens: Nonnegative hash dependency length.
+                Changing it or replacing a token in a cached lookahead
+                window invalidates the cached hash chain.
+
+        Raises:
+            ValueError: If the dependency length is negative.
         """
+        if num_hash_lookahead_tokens < 0:
+            raise ValueError("num_hash_lookahead_tokens must be nonnegative")
         with self._lock:
+            hashed_bytes = (
+                self.num_chunks_processed * self.hasher.chunk_size
+                + self.num_hash_lookahead_tokens
+            ) * TOKEN_STRIDE
+            if self.num_hash_lookahead_tokens != num_hash_lookahead_tokens or (
+                self.num_hash_lookahead_tokens
+                and self.num_chunks_processed
+                and packed_token_ids[:hashed_bytes] != self.tokens[:hashed_bytes]
+            ):
+                self.chunk_hashes.clear()
+                self.last_prefix_hash = None
+                self.num_chunks_processed = 0
+            self.num_hash_lookahead_tokens = num_hash_lookahead_tokens
             self.tokens = packed_token_ids
 
     @overload
@@ -90,13 +115,13 @@ class Session:
             start: Start token index (must be aligned to chunk_size).
             end: End token index (must be aligned to chunk_size).
                 When omitted (``None``), automatically set to the last
-                full-chunk boundary of the current token sequence.
+                full-chunk boundary with all hash dependencies available.
 
         Returns:
             List of hash values for chunks in [start_chunk, end_chunk).
 
         Raises:
-            ValueError: If an explicit ``end`` exceeds the current tokens
+            ValueError: If an explicit ``end`` plus lookahead exceeds the tokens
                 (hashing past them yields valid-looking garbage).
         """
         chunk_size = self.hasher.chunk_size
@@ -106,11 +131,13 @@ class Session:
         start_chunk = start // chunk_size
 
         with self._lock:
-            held = num_packed_tokens(self.tokens)
+            held = max(
+                0, num_packed_tokens(self.tokens) - self.num_hash_lookahead_tokens
+            )
             if end is not None and end > held:
                 raise ValueError(
                     f"get_hashes end ({end}) exceeds the session's "
-                    f"{held} token(s); the session may have "
+                    f"{held} hashable token(s); the session may have "
                     "been recreated after request cleanup"
                 )
             if end is None:
@@ -139,12 +166,14 @@ class Session:
 
         while self.num_chunks_processed < end_chunk:
             cs = self.num_chunks_processed * stride
-            chunk = view[cs : cs + stride]
+            chunk = view[
+                cs : cs + stride + self.num_hash_lookahead_tokens * TOKEN_STRIDE
+            ]
 
             prefix = (
                 self.last_prefix_hash
                 if self.last_prefix_hash is not None
-                else self.hasher.none_hash
+                else self.hasher.initial_prefix_hash(self.num_hash_lookahead_tokens)
             )
             h = self.hasher.hash_packed_chunk(chunk, prefix)
             self.last_prefix_hash = h
@@ -202,6 +231,8 @@ class Session:
                 and key.world_size == lookup_key.world_size
                 and key.token_bytes == lookup_key.token_bytes
                 and key.cache_salt == lookup_key.cache_salt
+                and key.num_hash_lookahead_tokens
+                == lookup_key.num_hash_lookahead_tokens
                 and key.start >= lookup_key.start
                 and key.end <= lookup_key.end
             )

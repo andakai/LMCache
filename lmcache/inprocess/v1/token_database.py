@@ -296,12 +296,30 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
 
 class ChunkedTokenDatabase(TokenDatabase):
+    """Map token prefixes to KV chunks, optionally hashing a following window.
+
+    ``extra_config.num_hash_lookahead_tokens`` reserves trailing tokens for
+    hashing only. In that mode only complete KV chunks are emitted, and returned
+    offsets exclude the lookahead window. Zero preserves legacy keys.
+    """
+
     def __init__(
         self,
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
     ):
         super(ChunkedTokenDatabase, self).__init__(config, metadata)
+
+        self.num_hash_lookahead_tokens = (
+            config.get_extra_config_value("num_hash_lookahead_tokens", 0)
+            if config is not None
+            else 0
+        )
+        if (
+            type(self.num_hash_lookahead_tokens) is not int
+            or self.num_hash_lookahead_tokens < 0
+        ):
+            raise ValueError("num_hash_lookahead_tokens must be a nonnegative integer")
 
         if config is not None:
             self.config = config
@@ -329,6 +347,16 @@ class ChunkedTokenDatabase(TokenDatabase):
             self.chunk_size = 256
 
     def _get_init_hash(self) -> int:
+        if self.num_hash_lookahead_tokens:
+            return self._hash_tokens(
+                [],
+                NONE_HASH,
+                [
+                    "lmcache-lookahead-v1",
+                    self.chunk_size,
+                    self.num_hash_lookahead_tokens,
+                ],
+            )
         return NONE_HASH
 
     def _chunk_tokens(
@@ -344,6 +372,12 @@ class ChunkedTokenDatabase(TokenDatabase):
         :return: a generator of chunks of tokens, each with
                 shape [chunk_size]
         """
+        if self.num_hash_lookahead_tokens:
+            end = max(0, len(tokens) - self.num_hash_lookahead_tokens)
+            for i in range(0, end - self.chunk_size + 1, self.chunk_size):
+                yield tokens[i : i + self.chunk_size + self.num_hash_lookahead_tokens]
+            return
+
         save_unfull_chunk = (
             self.config.save_unfull_chunk if self.config is not None else True
         )
@@ -383,8 +417,8 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         :param Optional[List[int]] offsets: The number of tokens in each chunk.
 
-        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
-            have the same length as tokens. And the mask should ALWAYS be like
+        :param Optional[torch.Tensor] mask: The mask for KV tokens, excluding
+            trailing hash-only lookahead tokens. The mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
 

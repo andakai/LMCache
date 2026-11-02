@@ -605,10 +605,12 @@ def test_response_encoder_compiles_its_codec_once(
     encode = proto_codec.compile_response_encoder_for_type(
         kv_event_service_pb2.KVEventBatch, KVEventBatch
     )
-    record = KVEventRecord(1, "stored", "cpu", "model", [b"h"], None, [1, 2, 3])
+    record = KVEventRecord(1, "stored", "cpu", "model", [b"h"], None, [1, 2, 3], [4, 5])
     batch = KVEventBatch(True, 1, 2, False, [record])
 
     first = encode(batch).SerializeToString()
+    message = kv_event_service_pb2.KVEventBatch.FromString(first)
+    assert list(message.events[0].lookahead_token_ids) == [4, 5]
     after_first = len(compiled)
     for _ in range(3):
         assert encode(batch).SerializeToString() == first
@@ -638,21 +640,24 @@ def test_grpc_object_key_without_extra_attributes_decodes_empty() -> None:
     assert decoded.identity == ObjectKey(b"chunk", "model", 0, 0, "tenant").identity
 
 
+@pytest.mark.parametrize("lookahead", [0, 1])
 def test_generated_grpc_services_communicate_end_to_end(
     grpc_client: tuple[GrpcMultiprocessClient, _Calls],
+    lookahead: int,
 ) -> None:
     client, calls = grpc_client
     key = IPCCacheServerKey(
         model_name="model",
         world_size=2,
         worker_id=None,
-        token_bytes=pack_token_ids((1, 2, 3)),
+        token_bytes=pack_token_ids((1, 2, 3, 4)),
         start=0,
         end=3,
         request_id="request",
         cache_salt="tenant",
         request_configs={"blend": True},
         num_kv_readers=2,
+        num_hash_lookahead_tokens=lookahead,
     )
 
     assert client.lookup(key, 2).result(timeout=5) is None

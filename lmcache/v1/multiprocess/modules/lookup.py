@@ -21,7 +21,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import LOOKAHEAD_HASHES, IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
     DiscoverableModule,
@@ -58,7 +58,10 @@ def resolve_prefetched_obj_keys(
     share), which is required for per-instance RETRIEVE failure cleanup.
     """
     chunk_hashes = ctx.token_hasher.compute_packed_chunk_hashes(
-        key.token_bytes, start=key.start, end=key.end
+        key.token_bytes,
+        start=key.start,
+        end=key.end,
+        num_hash_lookahead_tokens=key.num_hash_lookahead_tokens,
     )
     if not chunk_hashes:
         return []
@@ -146,6 +149,8 @@ class LookupModule(DiscoverableModule):
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
         """Build the lookup module; it applies to every configuration."""
+        if build_ctx.mp_config.engine_type != "blend":
+            build_ctx.add_experimental(LOOKAHEAD_HASHES)
         return cls(
             build_ctx.engine_context,
             create_kv_load_policy(
@@ -232,7 +237,9 @@ class LookupModule(DiscoverableModule):
         num_kv_readers = key.require_num_kv_readers()
 
         chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes, end=key.end
+            key.token_bytes,
+            end=key.end,
+            num_hash_lookahead_tokens=key.num_hash_lookahead_tokens,
         )
         if not chunk_hashes:
             self._register_empty_prefetch_job(
@@ -274,7 +281,9 @@ class LookupModule(DiscoverableModule):
             model_name, world_size
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
+        session.set_tokens(
+            key.token_bytes, num_hash_lookahead_tokens=key.num_hash_lookahead_tokens
+        )
 
         start_chunk = min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
         # The engine-covered prefix is never looked up, so it is excluded from

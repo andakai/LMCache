@@ -31,6 +31,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
 )
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
 from lmcache.v1.multiprocess.custom_types import (
+    LOOKAHEAD_HASHES,
     KVEventBatch,
     KVEventRecord,
 )
@@ -105,10 +106,11 @@ def _event_adapter(
     fake_adapter: tuple,
     parallel_strategy: ParallelStrategy | None = None,
     extra_config: dict | None = None,
+    num_hash_lookahead_tokens: int = 0,
 ) -> tuple[LMCacheMPWorkerAdapter, MagicMock, list[Callable]]:
     """Use cancellable streams at the stubbed network boundary."""
     _, client, _ = fake_adapter
-    client.get_experimental.return_value.result.return_value = []
+    client.get_experimental.return_value.result.return_value = [LOOKAHEAD_HASHES]
     senders = []
     ready = threading.Event()
 
@@ -146,6 +148,7 @@ def _event_adapter(
         extra_config=extra_config,
         enable_kv_events=True,
         parallel_strategy=parallel_strategy,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
     )
     assert adapter.get_kv_events() == []
     strategy = parallel_strategy or _parallel_strategy()
@@ -155,7 +158,9 @@ def _event_adapter(
 
 
 def _own_reporting_adapter(
-    fake_adapter: tuple, extra_config: dict | None = None
+    fake_adapter: tuple,
+    extra_config: dict | None = None,
+    num_hash_lookahead_tokens: int = 0,
 ) -> LMCacheMPWorkerAdapter:
     """Build a worker whose server has the KV event stream disabled.
 
@@ -163,7 +168,11 @@ def _own_reporting_adapter(
     ``enabled=False``, after which the worker reports its own completed
     stores as KV events.
     """
-    adapter, _, senders = _event_adapter(fake_adapter, extra_config=extra_config)
+    adapter, _, senders = _event_adapter(
+        fake_adapter,
+        extra_config=extra_config,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+    )
     senders[-1](KVEventBatch(False, 7, 0, False, []))
     return adapter
 
@@ -258,6 +267,7 @@ def _make_worker_adapter(
     extra_config: dict[str, object] | None = None,
     enable_kv_events: bool = False,
     parallel_strategy: ParallelStrategy | None = None,
+    num_hash_lookahead_tokens: int = 0,
 ) -> LMCacheMPWorkerAdapter:
     """Construct a worker adapter with the standard test arguments; the
     network boundary must already be patched (see ``fake_adapter``).
@@ -281,6 +291,7 @@ def _make_worker_adapter(
         mq_timeout=5.0,
         extra_config=extra_config,
         enable_kv_events=enable_kv_events,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
     )
 
 
@@ -889,15 +900,17 @@ def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypat
     ]
 
 
+@pytest.mark.parametrize("lookahead", [0, 1, 5])
 def test_store_kv_events_are_reported_after_successful_store(
     fake_adapter,
     monkeypatch,
+    lookahead,
 ):
     """Completed MP stores are exposed once as LMCache cache-store events."""
     # First Party
     from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
-    adapter = _own_reporting_adapter(fake_adapter)
+    adapter = _own_reporting_adapter(fake_adapter, num_hash_lookahead_tokens=lookahead)
     try:
         monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
         transfer_ctx = MagicMock()
@@ -908,7 +921,7 @@ def test_store_kv_events_are_reported_after_successful_store(
         adapter.transfer_ctx = transfer_ctx
 
         chunk_size = adapter.lmcache_tokens_per_chunk
-        token_ids = list(range(chunk_size * 2))
+        token_ids = list(range(chunk_size * 2 + lookahead))
         op = LoadStoreOp(
             token_bytes=pack_token_ids(token_ids),
             block_ids=[[1]],
@@ -926,6 +939,7 @@ def test_store_kv_events_are_reported_after_successful_store(
         ).compute_packed_chunk_hashes(
             pack_token_ids(token_ids),
             end=chunk_size * 2,
+            num_hash_lookahead_tokens=lookahead,
         )
 
         assert len(events) == 1
@@ -934,6 +948,9 @@ def test_store_kv_events_are_reported_after_successful_store(
         assert events[0].token_ids == token_ids[chunk_size : chunk_size * 2]
         assert events[0].block_size == chunk_size
         assert events[0].medium == "CPU"
+        assert events[0].lookahead_token_ids == (
+            [token_ids[chunk_size * 2 :]] if lookahead else None
+        )
         assert adapter.get_kv_events() == []
     finally:
         adapter.shutdown()
@@ -1496,6 +1513,7 @@ def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> Non
 
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {request.request_id: tracker}
+    connector._num_hash_lookahead_tokens = 0
     connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
 
     matched_tokens, load_async = connector.get_num_new_matched_tokens(

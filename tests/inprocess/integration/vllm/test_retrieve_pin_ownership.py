@@ -122,6 +122,7 @@ class _CacheCase:
 @pytest.fixture
 def cache_case(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> Generator[_CacheCase, None, None]:
     """Build three tiny CPU chunks with one cache reference apiece.
 
@@ -131,6 +132,7 @@ def cache_case(
 
     Args:
         monkeypatch: Restores the isolated dependency replacements after the test.
+        request: Optional indirect lookahead count, defaulting to legacy keys.
     Yields:
         The engine, backend, copy recorder, tokens, keys and corresponding objects.
     """
@@ -150,6 +152,8 @@ def cache_case(
         py_enable_gc=True,
         lmcache_instance_id="test_retrieve_pin_ownership",
     )
+    lookahead = getattr(request, "param", 0)
+    config.extra_config = {"num_hash_lookahead_tokens": lookahead}
     metadata = LMCacheMetadata(
         model_name="test_model",
         world_size=1,
@@ -169,7 +173,7 @@ def cache_case(
         config, dst_device="cpu", memory_allocator=AdHocMemoryAllocator(device="cpu")
     )
     engine.storage_manager = _SynchronousStorageManager(backend)
-    tokens = list(range(3 * CHUNK_SIZE))
+    tokens = list(range(3 * CHUNK_SIZE + lookahead))
     keys: list[CacheEngineKey] = []
     memory_objs: list[MemoryObj] = []
     try:
@@ -480,6 +484,7 @@ def test_unforced_remove_keeps_lookup_pin(cache_case: _CacheCase) -> None:
 # Existing cleanup contracts outside active synchronous retrieval
 
 
+@pytest.mark.parametrize("cache_case", [0, 1], indirect=True)
 @pytest.mark.parametrize(
     "completion,num_kv_tokens", [("retrieve", 8), ("retrieve", 12), ("cancel", 0)]
 )
@@ -512,7 +517,10 @@ def test_async_cleanup_releases_one_prefetch_pin(
     _complete_prefetch(engine, list(zip(cache_case.keys, prefetched, strict=True)))
 
     if completion == "retrieve":
-        mask = engine.retrieve(cache_case.tokens[:num_kv_tokens], req_id="A")
+        lookahead = len(cache_case.tokens) - 12
+        mask = engine.retrieve(
+            cache_case.tokens[: num_kv_tokens + lookahead], req_id="A"
+        )
         assert mask[:num_kv_tokens].all()
         assert not mask[num_kv_tokens:].any()
     # This is also called by wait_for_save after a successful load. It must not

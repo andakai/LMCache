@@ -14,7 +14,7 @@ import torch
 pytest.importorskip("vllm", reason="MP connector imports vLLM at module top")
 
 # Third Party
-from vllm.config import KVTransferConfig, VllmConfig  # noqa: E402
+from vllm.config import CacheConfig, KVTransferConfig, VllmConfig  # noqa: E402
 from vllm.distributed.kv_events import (  # noqa: E402
     BlockRemoved,
     BlockStored,
@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput  # noqa: E402
 from vllm.v1.request import Request, RequestStatus  # noqa: E402
@@ -240,6 +241,66 @@ def connectors(
     finally:
         worker.shutdown()
         scheduler.shutdown()
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 5])
+def test_lookahead_namespace_matches_scheduler_and_worker(
+    mock_io: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, lookahead: int
+) -> None:
+    """Collapsed scheduler specs and PP layer names must not split cache keys."""
+    config = _config(
+        KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+    )
+    config.num_hash_lookahead_tokens = lookahead
+    config.model_config.compute_hash = lambda: "target-revision"
+    config.speculative_config = SimpleNamespace(
+        method="mtp", compute_hash=lambda: "draft-revision"
+    )
+    config.cache_config = CacheConfig(block_size=4)
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    scheduler_factory = MagicMock(return_value=mock_io.scheduler)
+    worker_factory = MagicMock()
+    monkeypatch.setattr(connector_mod, "LMCacheMPSchedulerAdapter", scheduler_factory)
+    monkeypatch.setattr(
+        LMCacheMPConnector, "create_lmcache_mp_worker_adapter", worker_factory
+    )
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+    )
+    scheduler_cache = KVCacheConfig(8, [], [KVCacheGroupSpec(["layer.0"], spec)])
+    worker_cache = KVCacheConfig(
+        8,
+        [],
+        [
+            KVCacheGroupSpec(
+                ["layer.1"],
+                UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs={"layer.1": spec}),
+            )
+        ],
+    )
+    names = []
+    for role, cache, factory in (
+        (KVConnectorRole.SCHEDULER, scheduler_cache, scheduler_factory),
+        (KVConnectorRole.WORKER, worker_cache, worker_factory),
+    ):
+        connector = LMCacheMPConnector(config, role, cache)
+        try:
+            names.append(factory.call_args.kwargs["model_name"])
+            assert factory.call_args.kwargs["num_hash_lookahead_tokens"] == lookahead
+        finally:
+            connector.shutdown()
+    assert names[0] == names[1]
+    assert ("-lookahead-v1-" in names[0]) == bool(lookahead)
+    if lookahead:
+        config.speculative_config.compute_hash = lambda: "other-draft-revision"
+        connector = LMCacheMPConnector(
+            config, KVConnectorRole.SCHEDULER, scheduler_cache
+        )
+        try:
+            assert scheduler_factory.call_args.kwargs["model_name"] != names[0]
+        finally:
+            connector.shutdown()
 
 
 @pytest.mark.parametrize("save_decode_cache", [None, False, True])

@@ -425,6 +425,26 @@ def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
     assert module.read_kv_events("model", removed.next_cursor, 8).events == []
 
 
+def test_cpu_events_preserve_lookahead_separately_from_kv_tokens() -> None:
+    module, bus = _event_module()
+    key = _event_key(1)
+    _publish_kv(
+        bus,
+        EventType.MP_TOKENS,
+        chunk_hashes=[key.chunk_hash],
+        token_chunks=[[1, 2, 3, 4]],
+        token_offsets=[0],
+        parent_hashes=[None],
+        lookahead_token_chunks=[[5]],
+    )
+    _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
+    result = module.read_kv_events("model", 0, 8)
+    assert len(result.events) == 1
+    assert result.events[0].token_ids == [1, 2, 3, 4]
+    assert result.events[0].lookahead_token_ids == [5]
+    module.close()
+
+
 def test_event_log_pages_filters_models_and_reports_overflow() -> None:
     module, bus = _event_module(size=3)
     for index, model in enumerate(("model", "other", "model")):

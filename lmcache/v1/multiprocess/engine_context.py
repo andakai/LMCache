@@ -417,7 +417,9 @@ class MPCacheServerContext:
             ValueError: If ``key.worker_id`` is ``None``.
         """
         session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
+        session.set_tokens(
+            key.token_bytes, num_hash_lookahead_tokens=key.num_hash_lookahead_tokens
+        )
         if session.lookup_ipc_key is None:
             session.lookup_ipc_key = key.no_worker_id_version()
         chunk_hashes = [

@@ -478,7 +478,13 @@ class LookupMixin:
             to poll); on completion, the prefix coverage in tokens plus the
             found non-prefix segments. A result with nothing to retrieve also
             ends the request here (no retrieve will follow).
+
+        Raises:
+            ValueError: If the key requires lookahead; non-prefix matching
+                does not preserve those dependencies.
         """
+        if key.num_hash_lookahead_tokens:
+            raise ValueError("CacheBlend does not support lookahead hashes")
         rid = key.request_id
         chunk_size = self._ctx.chunk_size
 

@@ -547,6 +547,13 @@ class LMCacheEngine:
                             start,
                             end,
                         )
+                        lookahead = self.config.get_extra_config_value(
+                            "num_hash_lookahead_tokens", 0
+                        )
+                        if lookahead:
+                            stored_event.lookahead_token_ids = [
+                                convert_tokens_to_list(tokens, end, end + lookahead)
+                            ]
                         if isinstance(tokens, torch.Tensor):
                             stored_event.medium = tokens.device
                     elif hashes is not None:

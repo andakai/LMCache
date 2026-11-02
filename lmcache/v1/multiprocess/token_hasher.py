@@ -245,6 +245,8 @@ class TokenHasher:
         prefix_hash: Any = None,
         start: int = 0,
         end: int | None = None,
+        *,
+        num_hash_lookahead_tokens: int = 0,
     ) -> list[bytes]:
         """Compute rolling prefix hashes over a packed token buffer.
 
@@ -256,17 +258,21 @@ class TokenHasher:
             prefix_hash: Optional initial prefix hash (defaults to none_hash).
             start: Token-level start index (must be chunk-aligned).
             end: Token-level end index (must be chunk-aligned).
+            num_hash_lookahead_tokens: Subsequent tokens included in each
+                chunk's identity, but not in its stored KV range. Must be
+                nonnegative. Chunks missing these tokens are omitted.
 
         Returns:
             List of ``bytes`` hash values for chunks in ``[start, end)``.
         """
         hashes: list[bytes] = []
-        prefix_hash = self.none_hash if prefix_hash is None else prefix_hash
+        prefix_hash = self.initial_prefix_hash(num_hash_lookahead_tokens, prefix_hash)
         num_tokens = num_packed_tokens(packed)
-        effective_len = min(num_tokens, end) if end is not None else num_tokens
+        available = max(0, num_tokens - num_hash_lookahead_tokens)
+        effective_len = min(available, end) if end is not None else available
         num_complete = effective_len - effective_len % self.chunk_size
         view = memoryview(packed)
-        stride = self.chunk_size * TOKEN_STRIDE
+        stride = (self.chunk_size + num_hash_lookahead_tokens) * TOKEN_STRIDE
         for i in range(0, num_complete, self.chunk_size):
             offset = i * TOKEN_STRIDE
             prefix_hash = self.hash_packed_chunk(
@@ -282,6 +288,8 @@ class TokenHasher:
         prefix_hash: Any = None,
         start: int = 0,
         end: int | None = None,
+        *,
+        num_hash_lookahead_tokens: int = 0,
     ) -> list[bytes]:
         """Compute rolling prefix hashes for complete chunks in a token range.
 
@@ -300,21 +308,53 @@ class TokenHasher:
                 Chunks before this index are computed but not returned.
             end: Token-level end index (must be chunk-aligned). When
                 provided, hashing stops at this index.
+            num_hash_lookahead_tokens: Nonnegative number of subsequent
+                tokens required for each chunk's identity. These tokens
+                can lie beyond ``end`` and do not increase the KV range.
 
         Returns:
             List of ``bytes`` hash values for chunks in ``[start, end)``.
         """
         hashes: list[bytes] = []
-        prefix_hash = self.none_hash if prefix_hash is None else prefix_hash
-        effective_len = min(len(token_ids), end) if end is not None else len(token_ids)
+        prefix_hash = self.initial_prefix_hash(num_hash_lookahead_tokens, prefix_hash)
+        available = max(0, len(token_ids) - num_hash_lookahead_tokens)
+        effective_len = min(available, end) if end is not None else available
         num_complete = effective_len - effective_len % self.chunk_size
         for i in range(0, num_complete, self.chunk_size):
             prefix_hash = self.hash_tokens(
-                token_ids[i : i + self.chunk_size], prefix_hash
+                token_ids[i : i + self.chunk_size + num_hash_lookahead_tokens],
+                prefix_hash,
             )
             if i >= start:
                 hashes.append(self.hash_to_bytes(prefix_hash))
         return hashes
+
+    def initial_prefix_hash(
+        self, num_hash_lookahead_tokens: int = 0, prefix_hash: Any = None
+    ) -> Any:
+        """Seed a hash chain with its chunk and lookahead schema.
+
+        Args:
+            num_hash_lookahead_tokens: Nonnegative dependency length.
+                Zero preserves legacy hash identities.
+            prefix_hash: Optional caller-supplied seed, before schema salting.
+
+        Returns:
+            The initial rolling hash, suitable for ``hash_packed_chunk``.
+
+        Raises:
+            ValueError: If the dependency length is negative.
+        """
+        if num_hash_lookahead_tokens < 0:
+            raise ValueError("num_hash_lookahead_tokens must be nonnegative")
+        prefix_hash = self.none_hash if prefix_hash is None else prefix_hash
+        if not num_hash_lookahead_tokens:
+            return prefix_hash
+        # A token-aligned header also works with algorithms that unpack first.
+        schema = b"LMCacheLookahead" + pack_token_ids(
+            [1, self.chunk_size, num_hash_lookahead_tokens]
+        )
+        return self.hash_packed_chunk(schema, prefix_hash)
 
     @staticmethod
     def hash_to_bytes(hash_val: Any) -> bytes:

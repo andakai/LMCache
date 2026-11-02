@@ -76,7 +76,13 @@ class StoreMixin:
         Returns:
             The underlying ``LMCacheDrivenTransfer.store`` result
             (event handle, success).
+
+        Raises:
+            ValueError: If the key requires lookahead, which the fingerprint
+                matcher does not preserve.
         """
+        if key.num_hash_lookahead_tokens:
+            raise ValueError("CacheBlend does not support lookahead hashes")
         handle, store_ok, stored_mask = self._transfer_module.store_with_chunk_mask(
             key, instance_id, gpu_block_ids, event_ipc_handle
         )
