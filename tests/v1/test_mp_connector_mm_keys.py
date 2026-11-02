@@ -334,12 +334,16 @@ def test_lookahead_prompt_embeddings_skip_prefetch_lookup_and_store() -> None:
     connector.request_trackers = {}
     connector._num_hash_lookahead_tokens = 1
     connector._eager_prefetch = True
+    connector._reserve_last_token_for_lookup = False
+    connector._hit_alignment_tokens = 4
     connector._role = KVConnectorRole.SCHEDULER
     connector.lazy_offload = False
-    connector.scheduler_adapter = MagicMock()
+    connector.scheduler_adapter = MagicMock(lmcache_tokens_per_chunk=4)
+    connector.scheduler_adapter.check_lookup_result.return_value = None
     request = _FakeRequest(list(range(9)))
     request.prompt_embeds = object()
     connector.on_new_request(request)
+    connector.scheduler_adapter.maybe_submit_lookup_request.assert_not_called()
     assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
     connector.scheduler_adapter.maybe_submit_lookup_request.assert_not_called()
     tracker = connector.request_trackers[request.request_id]
