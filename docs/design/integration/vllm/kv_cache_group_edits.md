@@ -16,6 +16,12 @@ edits exist to restore one invariant the raw tensors can violate:
 > **The registered tensor's paging granularity must equal the block-id
 > granularity.**
 
+Opaque page views also preserve the resolved layout hint: NHD/BLNHC uses
+`[NB, 2, BS, 1, HS]`, while HND/BLHNC uses `[NB, 2, 1, BS, HS]`.
+Both cover the same bytes in the same order. Emitting an NHD view under an
+HND hint makes later detection mistake the block size for the head count,
+so transfer kernels can fail or infer false slot compression.
+
 ## Structure
 
 Each case is one `KVCacheGroupEdit` rule in the module's `_EDITS` registry:

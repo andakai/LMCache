@@ -46,6 +46,12 @@ staging object `(key, tag)`:
   up holding what readers see.
 - `finish_write_and_delete` never admits; it frees the staging object.
 
+Engine stores use `StorageManager.abort_write(l1_owners)` to discard their
+own reservations after a failed copy. The multiprocess transfer path queues
+this cleanup on the copy stream: earlier object groups may already have D2H
+work in flight, so their buffers cannot be freed in the exception handler.
+No partially copied object is admitted or sent to L2.
+
 **Expiry and eviction.** A staging object keeps its write TTL lock. Once the
 lock expires the reservation is abandoned:
 

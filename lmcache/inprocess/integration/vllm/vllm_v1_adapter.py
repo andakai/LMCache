@@ -781,11 +781,6 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
-        attn_metadata = forward_context.attn_metadata
-        if attn_metadata is None:
-            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
-            return
-
         # LMCache failed to initialize and is running in degraded mode; skip the
         # KV load so vLLM falls back to recompute instead of crashing EngineCore.
         if self.lmcache_engine is None:

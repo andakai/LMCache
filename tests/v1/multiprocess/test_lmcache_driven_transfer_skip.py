@@ -252,6 +252,34 @@ def test_store_reserves_real_page_zero_and_only_present_state_objects(
     ]
 
 
+def test_failed_store_discards_reservations_after_queued_copies(monkeypatch):
+    module, context, _reads, transfers = _make_checkpoint_module(monkeypatch)
+    callback = MagicMock()
+    monkeypatch.setattr(mod, "submit_callback_to_stream", callback)
+    context.transfer_object_group.side_effect = [None, RuntimeError("copy failed")]
+    module.context.storage_manager.reserve_write.side_effect = lambda keys, layout: {
+        key: MagicMock(
+            get_size=MagicMock(return_value=10),
+            get_l1_manager=MagicMock(return_value=5),
+        )
+        for key in keys
+    }
+    _, ok = module.store(
+        SimpleNamespace(request_id="req", worker_id=1),
+        1,
+        [[0, 1, 2, 3], [-1, -1, 0, 1], [-1, -1, 2, 3]],
+        b"producer",
+    )
+    assert not ok
+    assert context.transfer_object_group.call_count == 2
+    callback.assert_any_call(
+        context.cupy_stream,
+        "abort_write",
+        {"g0c0": 5, "g0c1": 5, "g1c1": 5},
+    )
+    assert all(c.args[1] != "finish_write" for c in callback.call_args_list)
+
+
 def test_retrieve_reads_and_transfers_only_in_window(monkeypatch):
     # Group 0 = full attention (-1): whole prefix; group 1 = mamba window 1:
     # only the last chunk.

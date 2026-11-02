@@ -480,10 +480,13 @@ def test_unforced_remove_keeps_lookup_pin(cache_case: _CacheCase) -> None:
 # Existing cleanup contracts outside active synchronous retrieval
 
 
-@pytest.mark.parametrize("completion", ["retrieve", "cancel"])
+@pytest.mark.parametrize(
+    "completion,num_kv_tokens", [("retrieve", 8), ("retrieve", 12), ("cancel", 0)]
+)
 def test_async_cleanup_releases_one_prefetch_pin(
     cache_case: _CacheCase,
     completion: Literal["retrieve", "cancel"],
+    num_kv_tokens: int,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Async cleanup keeps an external pin and accepts unpinned backend results.
@@ -491,6 +494,7 @@ def test_async_cleanup_releases_one_prefetch_pin(
     Args:
         cache_case: Three CPU objects returned through a real completed event.
         completion: Whether successful retrieval or cancellation consumes the result.
+        num_kv_tokens: KV range admitted after rounding or capping the lookup hit.
         caplog: Captures double-unpin and double-free warnings.
     """
     engine = cache_case.engine
@@ -508,13 +512,13 @@ def test_async_cleanup_releases_one_prefetch_pin(
     _complete_prefetch(engine, list(zip(cache_case.keys, prefetched, strict=True)))
 
     if completion == "retrieve":
-        assert engine.retrieve(cache_case.tokens, req_id="A").all()
-        # Successful retrieve retains the event record. Remove only the record,
-        # not its already-consumed references; aborted lookups use lookup_unpin.
-        engine.event_manager.pop_event(EventType.LOADING, "A")
-    else:
-        engine.lookup_unpin("A")
-        engine.lookup_unpin("A")
+        mask = engine.retrieve(cache_case.tokens[:num_kv_tokens], req_id="A")
+        assert mask[:num_kv_tokens].all()
+        assert not mask[num_kv_tokens:].any()
+    # This is also called by wait_for_save after a successful load. It must not
+    # consume the cache's reference or another lookup's pin a second time.
+    engine.lookup_unpin("A")
+    engine.lookup_unpin("A")
 
     _assert_counts(cache_case.memory_objs, [0, 0, 1])
     assert engine.event_manager.get_event_status(EventType.LOADING, "A") == (

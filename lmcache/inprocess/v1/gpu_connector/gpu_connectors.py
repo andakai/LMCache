@@ -12,6 +12,7 @@ from lmcache.inprocess.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
+from lmcache.v1.gpu_connector.kv_format import get_spec_class
 from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
@@ -36,6 +37,28 @@ from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+
+def _get_transfer_head_size(
+    kv_caches: List[torch.Tensor], engine_kv_format: lmcache_native.EngineKVFormat
+) -> int:
+    """Return the per-K/V head width expected by the in-process CUDA kernel.
+
+    Args:
+        kv_caches: Registered layer tensors in the resolved engine layout.
+        engine_kv_format: Format describing the registered tensors.
+
+    Returns:
+        Elements per K or V head, excluding the packed K+V factor.
+    """
+    head_size = get_head_size(kv_caches, engine_kv_format)
+    if engine_kv_format in (
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+    ):
+        # Format accessors return the packed K+V content width for CS layouts.
+        head_size //= 2
+    return head_size
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -258,7 +281,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.num_blocks = get_num_blocks(kv_caches, self.engine_kv_format)
         self.block_size = get_block_size(kv_caches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
-        self.head_size = get_head_size(kv_caches, self.engine_kv_format)
+        self.head_size = _get_transfer_head_size(kv_caches, self.engine_kv_format)
         self.block_stride_elems = (
             resolve_block_stride_and_log_layout(
                 kv_caches, self.engine_kv_format, layer_idx=0, group_idx=0
@@ -321,7 +344,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
         device_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
+            self._transfer_tensor(memory_obj.tensor),
             kv_cache_pointers,
             slot_mapping[start:end],
             self.device,
@@ -370,7 +393,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         with torch.cuda.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 device_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
+                    self._transfer_tensor(memory_obj.tensor),
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
@@ -386,7 +409,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 device_ops.multi_layer_kv_transfer(
-                    tmp_gpu_buffer,
+                    self._transfer_tensor(tmp_gpu_buffer),
                     kv_cache_pointers,
                     slot_mapping[start:end],
                     self.kvcaches[0].device,
@@ -423,6 +446,15 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
         return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    def _transfer_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """View legacy allocations as one packed plane for fused K/V transfers."""
+        if get_spec_class(self.engine_kv_format).is_fused_packed:
+            # V2 allocates [2, L, T, D] before discovering the engine layout.
+            # The fused kernel copies one plane with 2*D elements per token.
+            # Both directions use this view; no transpose or data copy is needed.
+            return tensor.view(1, self.num_layers, tensor.shape[2], -1)
+        return tensor
 
 
 class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
@@ -479,7 +511,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.num_blocks = get_num_blocks(self.kvcaches, self.engine_kv_format)
         self.block_size = get_block_size(self.kvcaches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
-        self.head_size = get_head_size(self.kvcaches, self.engine_kv_format)
+        self.head_size = _get_transfer_head_size(self.kvcaches, self.engine_kv_format)
         self.block_stride_elems = (
             resolve_block_stride_and_log_layout(
                 self.kvcaches, self.engine_kv_format, layer_idx=0, group_idx=0
@@ -567,6 +599,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
+            memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
             device_ops.multi_layer_kv_transfer(
                 memory_obj_tensor,
                 kv_cache_pointer,
@@ -599,6 +632,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 ):
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
+                    memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
                     device_ops.multi_layer_kv_transfer(
                         memory_obj_tensor,
                         kv_cache_pointer,
@@ -632,6 +666,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
+                    memory_obj_tensor = self._transfer_tensor(memory_obj_tensor)
                     memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
         if not memory_obj.raw_tensor.is_cuda:
@@ -655,6 +690,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         raise NotImplementedError
+
+    def _transfer_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Normalize allocations made before packed layer groups were discovered."""
+        if get_spec_class(self.engine_kv_format).is_fused_packed:
+            return tensor.view(1, tensor.shape[1], tensor.shape[2], -1)
+        return tensor
 
 
 class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):

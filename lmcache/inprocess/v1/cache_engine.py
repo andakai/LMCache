@@ -1686,9 +1686,9 @@ class LMCacheEngine:
 
         tot_kv_size = 0
         chunks: List[ProcessedChunk] = []
-        future = self.event_manager.get_event_future(
-            EventType.LOADING, kwargs["req_id"]
-        )
+        # Retrieval takes ownership of the prefetch result. Later lookup cleanup
+        # must not release these references again as if the request were aborted.
+        future = self.event_manager.pop_event(EventType.LOADING, kwargs["req_id"])
         # As mentioned in async_lookup_and_prefetch(), the future.result()
         # is key data pair for each chunk in each tier. So extract the key
         # and memory object pairs to memory_obj_map
@@ -1724,6 +1724,8 @@ class LMCacheEngine:
         # NOTE: free the memory objects that are not hit.
         for key, mem_obj in memory_obj_map.items():
             if key not in used_keys:
+                if mem_obj.is_pinned:
+                    mem_obj.unpin()
                 mem_obj.ref_count_down()
 
         return chunks, tot_kv_size

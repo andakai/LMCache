@@ -58,6 +58,28 @@ class _CPUConnector(LMCacheConnectorV1Impl):
         self.enable_blending = False
 
 
+@pytest.mark.parametrize("has_attn_metadata", [True, False])
+def test_scheduled_load_does_not_require_forward_attention_metadata(
+    cache_case: _CacheCase,  # noqa: F811 -- shared fixture
+    has_attn_metadata: bool,
+) -> None:
+    """Restore scheduled KV even when graph replay has no attention metadata."""
+    engine = cache_case.engine
+    assert engine.lookup(cache_case.tokens, lookup_id="A", pin=True) == 12
+    request = ReqMeta(
+        req_id="A",
+        token_ids=cache_case.tokens,
+        slot_mapping=torch.arange(12, dtype=torch.long),
+        load_spec=LoadSpec(0, 12, True),
+    )
+    connector = _CPUConnector([request], engine, "sync")
+    context = MagicMock(attn_metadata=object() if has_attn_metadata else None)
+    connector.start_load_kv(context)
+    _, starts, ends = cache_case.connector.batched_to_gpu.call_args.args
+    assert starts == [0, 4, 8] and ends == [4, 8, 12]
+    assert not engine.lookup_pins
+
+
 @pytest.mark.parametrize("loading", ["sync", "async", "layerwise"])
 def test_start_load_releases_sync_lookup_before_next_request(
     loading: Literal["sync", "async", "layerwise"],

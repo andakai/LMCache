@@ -266,6 +266,30 @@ class TestStorageManagerBasic:
 
         storage_manager.close()
 
+    def test_abort_write_releases_staging_without_admitting(
+        self, basic_storage_manager_config, basic_layout
+    ):
+        """Failed engine writes leave no locked buffers and can be retried."""
+        storage_manager = StorageManager(basic_storage_manager_config)
+        keys = [make_object_key(i) for i in range(3)]
+        try:
+            reserved = storage_manager.reserve_write(keys, basic_layout)
+            assert len(reserved) == len(keys)
+            owners = l1_owners_of(reserved)
+            # One group finished separately; discarding the failed groups must
+            # not delete the already resident key.
+            storage_manager.finish_write([keys[0]], owners)
+            storage_manager.abort_write({key: owners[key] for key in keys[1:]})
+            pools = storage_manager.report_status()["l1_managers"].values()
+            assert sum(p["total_object_count"] for p in pools) == 1
+            assert sum(p["write_locked_count"] for p in pools) == 0
+            assert sum(p["staging_object_count"] for p in pools) == 0
+            retry = storage_manager.reserve_write(keys, basic_layout)
+            assert set(retry) == set(keys[1:])
+            storage_manager.abort_write(l1_owners_of(retry))
+        finally:
+            storage_manager.close()
+
     def test_reserve_write_oom(self, small_storage_manager_config, large_layout):
         """Test reserve_write raises L1Error on out-of-memory."""
         storage_manager = StorageManager(small_storage_manager_config)

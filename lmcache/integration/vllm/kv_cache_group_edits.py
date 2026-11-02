@@ -204,13 +204,15 @@ def _synthetic_attention_page_view(
     num_blocks: int,
     block_size: int,
     page_size_bytes: int,
+    layout_hints: LayoutHints,
 ) -> torch.Tensor:
     """Re-view ``base`` as one opaque logical page per block.
 
-    The result is ``(num_blocks, 2, block_size, 1, head_size)`` in ``base``'s
-    dtype, starting at ``base``'s storage offset. Axis 1 holds two equal byte
-    slabs of the page, not semantic K and V. A list of these tensors detects
-    as ``NL_X_NB_TWO_BS_NH_HS`` (format 2).
+    The result is ``(num_blocks, 2, block_size, 1, head_size)`` for NHD, or
+    ``(num_blocks, 2, 1, block_size, head_size)`` for HND, in ``base``'s dtype
+    and starting at its storage offset. The resolved layout hint must also
+    describe these synthetic axes because format detection consumes it later.
+    Axis 1 holds two equal byte slabs of the page, not semantic K and V.
 
     Raises:
         ValueError: If the page does not factor into the synthetic shape.
@@ -222,6 +224,8 @@ def _synthetic_attention_page_view(
         (elems_per_page, 1),
         storage_offset=int(base.storage_offset()),
     )
+    if layout_hints.get("kv_layout", "NHD") in ("HND", "BLHNC"):
+        return flat.reshape(num_blocks, 2, num_heads, block_size, head_size)
     return flat.reshape(num_blocks, 2, block_size, num_heads, head_size)
 
 
@@ -298,7 +302,7 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
         self,
         spec: KVCacheSpec,
         kv_cache: RegisteredKVCache,
-        _layout_hints: LayoutHints,
+        layout_hints: LayoutHints,
     ) -> torch.Tensor:
         # vLLM lays out one padded page per block as (conv | ssm | pad). The
         # conv state's leading dim is the block count and its per-block stride
@@ -322,6 +326,7 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
             int(conv_state.shape[0]),
             int(spec.block_size),
             int(spec.page_size_bytes),
+            layout_hints,
         )
 
 
@@ -474,7 +479,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
         self,
         spec: KVCacheSpec,
         kv_cache: RegisteredKVCache,
-        _layout_hints: LayoutHints,
+        layout_hints: LayoutHints,
     ) -> torch.Tensor:
         """Re-view ``kv_cache`` at logical-block granularity.
 
@@ -552,13 +557,8 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
                     f"count {num_kernel_pages}"
                 )
         else:
-            # Rank 5 deliberately keeps the stricter logical-order guard.
-            # Extending the rank-4 memory-order normalization to rank 5 would
-            # let a permuted tensor (vLLM <= 0.25.x under HND) re-view
-            # successfully and then be misread downstream: the edited view is
-            # NHD-shaped, so the HND detector branch reads its block size from
-            # the synthetic ``num_heads`` axis and resolves 1. Failing loudly
-            # here is strictly better than that silent corruption.
+            # Rank-5 registration still requires logical-order contiguity;
+            # only rank 4 supports memory-order normalization here.
             ordered = kv_cache
             if not ordered.is_contiguous():
                 raise ValueError(
@@ -571,6 +571,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
             num_kernel_pages // ratio,
             logical_block_size,
             int(spec.page_size_bytes),
+            layout_hints,
         )
 
 
@@ -895,7 +896,7 @@ class _SubpagedAttentionInterleavedPlaneViewEdit(KVCacheGroupEdit):
         self,
         spec: KVCacheSpec,
         kv_cache: RegisteredKVCache,
-        _layout_hints: LayoutHints,
+        layout_hints: LayoutHints,
     ) -> torch.Tensor:
         """Re-view interleaved kernel pages at logical-block granularity.
 
@@ -936,6 +937,7 @@ class _SubpagedAttentionInterleavedPlaneViewEdit(KVCacheGroupEdit):
             num_kernel_pages // ratio,
             logical_block_size,
             page_size_bytes,
+            layout_hints,
         )
 
 
