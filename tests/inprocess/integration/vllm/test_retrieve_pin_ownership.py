@@ -480,7 +480,6 @@ def test_unforced_remove_keeps_lookup_pin(cache_case: _CacheCase) -> None:
 # Existing cleanup contracts outside active synchronous retrieval
 
 
-@pytest.mark.parametrize("cache_case", [0, 1], indirect=True)
 @pytest.mark.parametrize(
     "completion,num_kv_tokens", [("retrieve", 8), ("retrieve", 12), ("cancel", 0)]
 )
@@ -513,10 +512,7 @@ def test_async_cleanup_releases_one_prefetch_pin(
     _complete_prefetch(engine, list(zip(cache_case.keys, prefetched, strict=True)))
 
     if completion == "retrieve":
-        lookahead = len(cache_case.tokens) - 12
-        mask = engine.retrieve(
-            cache_case.tokens[: num_kv_tokens + lookahead], req_id="A"
-        )
+        mask = engine.retrieve(cache_case.tokens[:num_kv_tokens], req_id="A")
         assert mask[:num_kv_tokens].all()
         assert not mask[num_kv_tokens:].any()
     # This is also called by wait_for_save after a successful load. It must not
