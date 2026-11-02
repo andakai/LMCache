@@ -3,7 +3,6 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import hashlib
 import math
 import os
 import sys
@@ -46,6 +45,7 @@ from lmcache.inprocess.v1.compute.blend import LMCBlenderBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
+from lmcache.integration.vllm.utils import get_lookahead_cache_salt
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
@@ -114,14 +114,7 @@ def _lookahead_request_configs(request: "Request") -> dict[str, Any]:
         Request configuration with the lookahead identity stored as a key tag.
     """
     configs = dict(extract_request_configs(request.sampling_params) or {})
-    lora = request.lora_request
-    identity = (
-        request.cache_salt,
-        (lora.lora_name, lora.lora_int_id) if lora else None,
-    )
-    configs["lmcache.tag.lookahead_request"] = hashlib.sha256(
-        repr(identity).encode()
-    ).hexdigest()
+    configs["lmcache.tag.lookahead_request"] = get_lookahead_cache_salt(request)
     return configs
 
 

@@ -155,6 +155,23 @@ def extract_request_configs_from_request(
     )
 
 
+def get_lookahead_cache_salt(request: "Request") -> str:
+    """Combine request salt and core's LoRA identity for lookahead keys.
+
+    Args:
+        request: Request whose KV is being looked up or stored.
+
+    Returns:
+        Stable digest distinguishing cache salts and LoRA names/paths.
+    """
+    lora = request.lora_request
+    identity = (
+        request.cache_salt,
+        (lora.lora_name, lora.lora_path) if lora else None,
+    )
+    return hashlib.sha256(repr(identity).encode()).hexdigest()
+
+
 # Number of bits kept per substituted placeholder token. 31 bits keeps the
 # values positive in a signed int32, the narrowest integer type token IDs may
 # pass through on any downstream serialization path.

@@ -65,7 +65,8 @@ while the transfer copies only KV 1--16. The next key covers tokens 17--33
 and the preceding key. Incomplete hash windows are not saved, and do not
 advance the saved-token boundary. Zero lookahead preserves legacy keys.
 Lookahead entries use a distinct model/draft/cache-layout namespace and retain
-LoRA and cache-salt identities; legacy writers cannot supply these entries.
+LoRA name/path and cache-salt identities; legacy writers cannot supply these
+entries. Process-local LoRA integer IDs are not part of the cache identity.
 
 The initial in-process path requires one full-attention KV group and excludes
 pipeline/context parallelism, layerwise transfer, CacheBlend, and LMCache P/D.

@@ -1513,6 +1513,7 @@ def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> Non
 
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {request.request_id: tracker}
+    connector._num_hash_lookahead_tokens = 0
     connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
 
     matched_tokens, load_async = connector.get_num_new_matched_tokens(

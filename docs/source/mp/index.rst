@@ -62,6 +62,9 @@ the legacy path. Do not mix client/server builds while lookahead is enabled.
 
 Positive-lookahead keys use a separate model/draft-configuration namespace and
 hash schema, so they do not reuse legacy entries. H=0 preserves legacy keys.
+The request salt also includes LoRA name/path, matching vLLM core's identity
+instead of process-local adapter IDs. Prompt embeddings bypass external lookup
+and store because their token IDs alone cannot identify the KV.
 KV events carry dependency tokens separately from the stored chunk's tokens.
 This applies to MP mode; it does not enable the separate in-process connector.
 

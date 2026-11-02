@@ -75,6 +75,8 @@ class _FakeRequest:
         self.resumable = False
         self.status = RequestStatus.WAITING
         self.cache_salt = cache_salt
+        self.lora_request = None
+        self.prompt_embeds = None
         self.prompt_token_ids = list(prompt_token_ids)
         self.num_prompt_tokens = len(prompt_token_ids)
         self._live_token_ids = list(prompt_token_ids)
@@ -198,6 +200,7 @@ def test_eager_prefetch_forwards_request_configs():
     connector = SimpleNamespace(
         role=KVConnectorRole.SCHEDULER,
         _eager_prefetch=True,
+        _num_hash_lookahead_tokens=0,
         _reserve_last_token_for_lookup=False,
         scheduler_adapter=scheduler_adapter,
         _get_or_create_request_tracker=MagicMock(return_value=tracker),
@@ -232,6 +235,7 @@ def test_lookup_hint_carries_vllm_prefix_hit() -> None:
     scheduler_adapter.check_lookup_result.return_value = None
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
+    connector._num_hash_lookahead_tokens = 0
     connector.scheduler_adapter = scheduler_adapter
     connector._reserve_last_token_for_lookup = False
     connector.lazy_offload = False
@@ -251,6 +255,7 @@ def test_recurrent_lookup_reserves_final_prompt_token() -> None:
     scheduler_adapter.check_lookup_result.return_value = 64
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
+    connector._num_hash_lookahead_tokens = 0
     connector.scheduler_adapter = scheduler_adapter
     connector._reserve_last_token_for_lookup = True
     connector._hit_alignment_tokens = 64
@@ -279,6 +284,73 @@ def _prepare_storable_tracker(request: _FakeRequest) -> LMCacheMPRequestTracker:
     tracker.allocated_block_ids = {0: [0, 1]}
     tracker.num_scheduled_tokens = 8
     return tracker
+
+
+def test_lookahead_lookup_and_store_isolate_request_identity() -> None:
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {}
+    connector._num_hash_lookahead_tokens = 1
+    connector._reserve_last_token_for_lookup = False
+    connector._hit_alignment_tokens = 4
+    connector.lazy_offload = False
+    connector.scheduler_adapter = MagicMock(lmcache_tokens_per_chunk=4)
+    connector.scheduler_adapter.check_lookup_result.return_value = None
+    salts = []
+    for index, (name, path, local_id, salt) in enumerate(
+        [
+            ("adapter", "adapter-a", 1, "tenant"),
+            ("adapter", "adapter-b", 1, "tenant"),
+            ("adapter", "adapter-a", 2, "tenant"),
+            ("other", "adapter-a", 1, "tenant"),
+            ("adapter", "adapter-a", 1, "other-tenant"),
+            (None, None, None, "tenant"),
+        ]
+    ):
+        request = _FakeRequest(list(range(9)), cache_salt=salt)
+        request.request_id = f"identity-{index}"
+        if name is not None:
+            request.lora_request = SimpleNamespace(
+                lora_name=name, lora_path=path, lora_int_id=local_id
+            )
+        assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+        lookup = connector.scheduler_adapter.maybe_submit_lookup_request.call_args
+        tracker = connector.request_trackers[request.request_id]
+        tracker.allocated_block_ids = {0: [0, 1]}
+        tracker.num_scheduled_tokens = 8
+        meta = LMCacheMPRequestMetadata.GetStoreMetadata(
+            tracker, 4, [4], num_hash_lookahead_tokens=1
+        )
+        assert meta is not None
+        assert meta.cache_salt == lookup.kwargs["cache_salt"]
+        assert meta.op.token_bytes == lookup.kwargs["packed_token_ids"]
+        assert meta.op.end == 8
+        salts.append(meta.cache_salt)
+    assert salts[0] == salts[2]  # Local adapter IDs do not identify KV.
+    assert len(set(salts)) == 5
+
+
+def test_lookahead_prompt_embeddings_skip_prefetch_lookup_and_store() -> None:
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {}
+    connector._num_hash_lookahead_tokens = 1
+    connector._eager_prefetch = True
+    connector._role = KVConnectorRole.SCHEDULER
+    connector.lazy_offload = False
+    connector.scheduler_adapter = MagicMock()
+    request = _FakeRequest(list(range(9)))
+    request.prompt_embeds = object()
+    connector.on_new_request(request)
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    connector.scheduler_adapter.maybe_submit_lookup_request.assert_not_called()
+    tracker = connector.request_trackers[request.request_id]
+    tracker.allocated_block_ids = {0: [0, 1]}
+    tracker.num_scheduled_tokens = 8
+    assert (
+        LMCacheMPRequestMetadata.GetStoreMetadata(
+            tracker, 4, [4], num_hash_lookahead_tokens=1
+        )
+        is None
+    )
 
 
 def test_store_metadata_uses_mm_adjusted_token_ids():

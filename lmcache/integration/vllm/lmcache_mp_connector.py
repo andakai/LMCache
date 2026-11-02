@@ -80,6 +80,7 @@ from lmcache.integration.vllm.mp_server_launcher import (
     is_mp_server_autostart_enabled,
 )
 from lmcache.integration.vllm.utils import (
+    get_lookahead_cache_salt,
     mla_only,
     vllm_layout_hints,
 )
@@ -1369,6 +1370,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         tracker = self._get_or_create_request_tracker(request)
 
+        if self._num_hash_lookahead_tokens and request.prompt_embeds is not None:
+            return 0, False
+
         # A failed asynchronous load is bypassed until vLLM admits the request
         # for local computation via update_state_after_alloc().  The scheduler
         # may poll this method repeatedly before that admission; do not submit
@@ -1543,6 +1547,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if self.role != KVConnectorRole.SCHEDULER:
             return
         if not self._eager_prefetch or request.resumable:
+            return
+        if self._num_hash_lookahead_tokens and request.prompt_embeds is not None:
             return
 
         tracker = self._get_or_create_request_tracker(request)
@@ -2053,6 +2059,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 for session_id in actions.sessions_to_end:
                     self.scheduler_adapter.end_session(session_id)
             new_tracker = LMCacheMPRequestTracker(request)
+            if self._num_hash_lookahead_tokens:
+                new_tracker.cache_salt = get_lookahead_cache_salt(request)
+                if request.prompt_embeds is not None:
+                    new_tracker.max_offload_tokens = 0
             self.request_trackers[request_id] = new_tracker
         return self.request_trackers[request_id]
 

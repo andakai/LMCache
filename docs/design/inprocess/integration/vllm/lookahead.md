@@ -9,7 +9,8 @@ For chunk size C and lookahead H, chunk i hashes tokens `[i*C:(i+1)*C+H]`
 and the previous digest. The initial digest includes protocol version, C and H.
 H=0 preserves the previous hash chain exactly. The model key namespace includes
 model/draft/cache configuration, TP size, KV shape and H. Request key tags include
-LoRA and cache salt alongside user-provided tags; multimodal substitutions cover
+LoRA name/path (matching core, not process-local adapter IDs) and cache salt
+alongside user-provided tags; multimodal substitutions cover
 the suffix as well as the KV token range.
 
 The scheduler bounds the save range by both scheduled accepted tokens and

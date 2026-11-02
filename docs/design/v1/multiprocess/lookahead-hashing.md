@@ -38,3 +38,9 @@ while retaining all accepted token bytes in the IPC key. Client-generated and
 server-generated events carry the suffix separately. Existing preemption and
 store completion ownership are retained; no new finish-time store is queued.
 In-process integrations and the vLLM builtin fallback are separate adapters.
+
+For H>0, the vLLM MP adapter combines request cache salt and LoRA name/path
+into a stable request salt shared by lookup, store and retrieve. Local LoRA
+integer IDs do not identify KV across processes. Prompt embeddings bypass
+external lookup and store because placeholder token IDs do not identify their
+contents. H=0 retains the existing request salt behavior.

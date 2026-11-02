@@ -33,6 +33,7 @@ pytest.importorskip("vllm")
 # Third Party
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -51,11 +52,9 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 
 
-@pytest.mark.parametrize("resolved_block_size", [16, 32, 64])
-def test_scheduler_slots_use_resolved_kv_group_block_size(
-    monkeypatch: pytest.MonkeyPatch, resolved_block_size: int
-) -> None:
-    """Allocator block IDs must map to physical KV slots, not CLI block units."""
+@pytest.fixture(params=[16, 32, 64])
+def scheduler_connector(monkeypatch: pytest.MonkeyPatch, request):
+    resolved_block_size = request.param
     config = LMCacheEngineConfig.from_defaults(chunk_size=16)
     monkeypatch.setattr(adapter, "lmcache_get_or_create_config", lambda: config)
     monkeypatch.setattr(adapter, "VllmServiceFactory", MagicMock())
@@ -89,6 +88,12 @@ def test_scheduler_slots_use_resolved_kv_group_block_size(
         MagicMock(),
         SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]),
     )
+    return connector, resolved_block_size
+
+
+def test_scheduler_slots_use_resolved_kv_group_block_size(scheduler_connector) -> None:
+    """Allocator block IDs must map to physical KV slots, not CLI block units."""
+    connector, resolved_block_size = scheduler_connector
     request = Request(
         "resolved-slots",
         list(range(resolved_block_size + 1)),
@@ -109,6 +114,47 @@ def test_scheduler_slots_use_resolved_kv_group_block_size(
         range(2 * resolved_block_size, 3 * resolved_block_size)
     )
     assert metadata.requests[0].lookahead_token_ids == [resolved_block_size]
+
+
+def test_lookup_and_store_use_core_lora_identity(scheduler_connector) -> None:
+    connector, block_size = scheduler_connector
+    connector.lookup_client.lookup_cache.return_value = -1
+    connector.lookup_client.lookup.return_value = None
+    identities = []
+    for index, lora in enumerate(
+        [
+            LoRARequest("adapter", 1, "adapter-a"),
+            LoRARequest("adapter", 1, "adapter-b"),
+            LoRARequest("adapter", 2, "adapter-a"),
+            LoRARequest("other", 1, "adapter-a"),
+            None,
+        ]
+    ):
+        request = Request(
+            f"identity-{index}",
+            list(range(block_size + 1)),
+            SamplingParams(max_tokens=1),
+            None,
+            lora_request=lora,
+        )
+        assert connector.get_num_new_matched_tokens(request, 0) is None
+        lookup_configs = connector.lookup_client.lookup.call_args.kwargs[
+            "request_configs"
+        ]
+        connector.update_state_after_alloc(request, 0)
+        metadata = connector.build_connector_meta(
+            SimpleNamespace(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[NewRequestData.from_request(request, ([2],))],
+                num_scheduled_tokens={request.request_id: block_size},
+                scheduled_cached_reqs=[],
+            )
+        )
+        assert len(metadata.requests) == 1
+        assert metadata.requests[0].request_configs == lookup_configs
+        identities.append(lookup_configs["lmcache.tag.lookahead_request"])
+    assert identities[0] == identities[2]
+    assert len(set(identities)) == 4
 
 
 @pytest.mark.parametrize("lookahead", [1, 3, 17])
