@@ -902,9 +902,7 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
-            tokens = request.token_ids + (
-                request.lookahead_token_ids if self.num_hash_lookahead_tokens else []
-            )
+            tokens = request.token_ids + request.lookahead_token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
             assert len(request.token_ids) == len(slot_mapping)
@@ -1321,12 +1319,7 @@ class LMCacheConnectorV1Impl:
                     )
 
             self.lmcache_engine.store(
-                token_ids
-                + (
-                    request.lookahead_token_ids
-                    if self.num_hash_lookahead_tokens
-                    else []
-                ),
+                token_ids + request.lookahead_token_ids,
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
