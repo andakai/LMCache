@@ -80,7 +80,6 @@ def test_scheduled_load_does_not_require_forward_attention_metadata(
     assert not engine.lookup_pins
 
 
-
 @pytest.mark.parametrize("loading", ["sync", "async", "layerwise"])
 def test_start_load_releases_sync_lookup_before_next_request(
     loading: Literal["sync", "async", "layerwise"],

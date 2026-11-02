@@ -213,3 +213,15 @@ The historical :download:`Installation compatibility CSV
 <Installation_compatibility_matrix.csv>` covers older LMCache 0.3--0.4
 releases. It should not be used as the current source of truth; this page and
 the linked feature recipes describe the current compatibility policy.
+
+KV transfer correctness
+-----------------------
+
+In-process V2/V3 transfers normalize fused K/V buffers allocated before layout
+discovery. Multiprocess synthetic page views preserve the resolved NHD/HND
+layout, and failed stores discard their reservations only after queued copies
+finish. These fixes do not require speculative decoding or change cache keys.
+
+Scheduled in-process loads use connector metadata even when CUDA graph replay
+provides no forward attention metadata. Asynchronous retrieval consumes each
+prefetch result once, so later request cleanup cannot release it a second time.
