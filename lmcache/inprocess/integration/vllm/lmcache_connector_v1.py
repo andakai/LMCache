@@ -21,8 +21,8 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.config import KVTransferConfig
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.config import KVTransferConfig
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
