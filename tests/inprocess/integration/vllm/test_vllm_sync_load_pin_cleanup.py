@@ -64,10 +64,12 @@ class _CPUConnector(LMCacheConnectorV1Impl):
 
 
 @pytest.mark.parametrize("cache_case", [1, 3, 17], indirect=True)
+@pytest.mark.parametrize("has_attn_metadata", [True, False])
 def test_lookahead_load_uses_kv_offsets_and_reports_failed_blocks(
     cache_case: _CacheCase,  # noqa: F811 -- shared fixture
+    has_attn_metadata: bool,
 ) -> None:
-    """Actual CPU lookup/retrieve agrees on suffix keys and KV-sized failures."""
+    """Restore scheduled KV even when graph replay has no attention metadata."""
     lookahead = len(cache_case.tokens) - 12
     engine = cache_case.engine
     assert engine.lookup(cache_case.tokens, lookup_id="A", pin=True) == 12
@@ -79,7 +81,8 @@ def test_lookahead_load_uses_kv_offsets_and_reports_failed_blocks(
         load_spec=LoadSpec(0, 12, True),
     )
     connector = _CPUConnector([request], engine, "sync", lookahead)
-    connector.start_load_kv(MagicMock(attn_metadata=object()))
+    context = MagicMock(attn_metadata=object() if has_attn_metadata else None)
+    connector.start_load_kv(context)
     assert not connector.get_block_ids_with_load_errors()
     _, starts, ends = cache_case.connector.batched_to_gpu.call_args.args
     assert starts == [0, 4, 8] and ends == [4, 8, 12]
@@ -87,7 +90,7 @@ def test_lookahead_load_uses_kv_offsets_and_reports_failed_blocks(
 
     # Invalidate the final hash window after a lookup, as with an expired entry.
     request.lookahead_token_ids[-1] += 1000
-    connector.start_load_kv(MagicMock(attn_metadata=object()))
+    connector.start_load_kv(context)
     assert connector.get_block_ids_with_load_errors() == {2}
 
 
