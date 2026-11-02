@@ -104,7 +104,7 @@ def patch_pin_allocator():
 def test_packed_kv_transfer(use_gpu: bool, layout: str, version: int) -> None:
     """Copy both K and V exactly, including strided blocks and partial chunks."""
     nb, nl, bs, nh, hs, chunk_size = 5, 3, 16, 4, 32, 16
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch_dev.current_device())
     shape = (nb, nl, bs, nh, 2 * hs)
     if layout == "HND":
         shape = (nb, nl, nh, bs, 2 * hs)
@@ -138,7 +138,7 @@ def test_packed_kv_transfer(use_gpu: bool, layout: str, version: int) -> None:
         obj_shape = metadata.get_shapes(num_tokens)[0]
         memory_obj = allocator.allocate(obj_shape, pool.dtype)
         assert memory_obj is not None
-        torch.cuda.synchronize()
+        torch_dev.synchronize()
         connector.from_gpu(
             memory_obj, 0, num_tokens, kvcaches=layers, slot_mapping=slots
         )
@@ -154,7 +154,7 @@ def test_packed_kv_transfer(use_gpu: bool, layout: str, version: int) -> None:
         )
 
         pool.fill_(-1)
-        torch.cuda.synchronize()
+        torch_dev.synchronize()
         connector.batched_to_gpu(
             [memory_obj],
             [0],

@@ -42,7 +42,15 @@ logger = init_logger(__name__)
 def _get_transfer_head_size(
     kv_caches: List[torch.Tensor], engine_kv_format: lmcache_native.EngineKVFormat
 ) -> int:
-    """Return the per-K/V head width expected by the in-process CUDA kernel."""
+    """Return the per-K/V head width expected by the in-process CUDA kernel.
+
+    Args:
+        kv_caches: Registered layer tensors in the resolved engine layout.
+        engine_kv_format: Format describing the registered tensors.
+
+    Returns:
+        Elements per K or V head, excluding the packed K+V factor.
+    """
     head_size = get_head_size(kv_caches, engine_kv_format)
     if engine_kv_format in (
         lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
